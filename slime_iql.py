@@ -250,11 +250,11 @@ if __name__ == "__main__":
         required=False
     )
     
-    parser.add_argument("--train", type=bool, default=False, required=False)
+    parser.add_argument("--train", type=bool, default=True, required=False)
 
     parser.add_argument("--random_seed", type=int, default=42, required=False)
 
-    parser.add_argument("--print_metrics", type=int, default=30, required=False)
+    parser.add_argument("--print_metrics", type=int, default=100, required=False)
     
     parser.add_argument("--render", type=bool, default=False, required=False)
     

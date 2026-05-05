@@ -10,7 +10,7 @@ from scipy.ndimage import gaussian_filter
 from gymnasium.spaces import Discrete, MultiBinary, Box
 
 from pettingzoo import AECEnv
-from pettingzoo.utils import agent_selector
+from pettingzoo.utils.agent_selector import agent_selector
 from pettingzoo.utils.env import ObsType
 
 class Slime(AECEnv):
@@ -603,6 +603,9 @@ class Slime(AECEnv):
         """
         Compute the cluster length.
         """
+
+        if len(clusters) == 0:
+            return 0.0
 
         cluster_sum = 0
         for cluster in clusters:

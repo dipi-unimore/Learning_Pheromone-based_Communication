@@ -205,7 +205,7 @@ def train(
                     avg_mixed_cluster,
                     avg_only_scatter,
                     avg_mixed_scatter
-                ) = env.avg_cluster2()
+                ) = env.avg_cluster()
                 only_cluster_dict[str(ep)] += round(avg_only_cluster, 2)
                 mixed_cluster_dict[str(ep)] += round(avg_mixed_cluster, 2)
                 only_scatter_dict[str(ep)] += round(avg_only_scatter, 2)
@@ -351,7 +351,7 @@ def eval(
                     avg_mixed_cluster,
                     avg_only_scatter,
                     avg_mixed_scatter
-                ) = env.avg_cluster2()
+                ) = env.avg_cluster()
                 only_cluster_dict[str(ep)] += round(avg_only_cluster, 2)
                 mixed_cluster_dict[str(ep)] += round(avg_mixed_cluster, 2)
                 only_scatter_dict[str(ep)] += round(avg_only_scatter, 2)

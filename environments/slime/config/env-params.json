@@ -1,6 +1,6 @@
 {
     "cluster_learners": 20,
-    "scatter_learners": 0,
+    "scatter_learners": 10,
     "actions": [
         "random-walk",
         "drop-chemical",
@@ -21,7 +21,7 @@
     "cluster_penalty": -1,
     "scatter_rew": 0,
     "scatter_penalty": -1,
-    "episode_ticks": 500,
+    "episode_ticks": 250,
     "W": 22,
     "H": 22,
     "PATCH_SIZE": 20,
