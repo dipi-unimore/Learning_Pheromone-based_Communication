@@ -21,24 +21,32 @@ class Logger:
         log_params: Dict,
         train: bool,
         buffer_size: int,
-        weights_file=None
+        weights_file=None,
+        run_tag: str = "",
     ) -> None:
 
         mode = "train" if train else "eval"
         time_now = datetime.datetime.now().strftime("%m_%d_%Y__%H_%M_%S")
+        tag_suffix = f"_{run_tag}" if run_tag else ""
 
         base_dir = os.path.join(curdir, "runs/" + mode)
         if not os.path.isdir(base_dir):
             os.makedirs(base_dir)
 
-        output_dir = os.path.join(base_dir, mode + "_" + time_now)
+        output_dir = os.path.join(base_dir, mode + "_" + time_now + tag_suffix)
         if not os.path.isdir(output_dir):
             os.makedirs(output_dir)
         
-        filename = log_params[mode + "_output_file"].replace("-", "_") + '_' + time_now + OUTPUT_FILE_EXTENSION
+        filename = (
+            log_params[mode + "_output_file"].replace("-", "_")
+            + '_'
+            + time_now
+            + tag_suffix
+            + OUTPUT_FILE_EXTENSION
+        )
         self.output_file = os.path.join(output_dir, filename)
         
-        params_filename = log_params[mode + "_params_file"] + '_' + time_now + PARAMS_FILE_EXTENSION
+        params_filename = log_params[mode + "_params_file"] + '_' + time_now + tag_suffix + PARAMS_FILE_EXTENSION
         self.params_file = os.path.join(output_dir, params_filename)
         
         weights_dir = os.path.join(curdir, "runs/weights")
@@ -46,7 +54,7 @@ class Logger:
             os.makedirs(weights_dir)
         
         if train:
-            weights_filename = log_params[mode + "_weights_file"] + '_' + time_now + WEIGHTS_FILE_EXTENSION 
+            weights_filename = log_params[mode + "_weights_file"] + '_' + time_now + tag_suffix + WEIGHTS_FILE_EXTENSION
             self.weights_file = os.path.join(weights_dir, weights_filename)
         else:
             if weights_file is None:

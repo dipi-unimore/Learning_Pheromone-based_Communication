@@ -58,9 +58,11 @@ The main script is `slime_iql.py`, which accepts the following command-line argu
 |---------------------|---------|---------------|-----------------------------------------------------------------------|
 | `--train`           | bool    | False         | If `True`, training of the agents will be performed, else evaluation. |
 | `--random_seed`     | int     | 42            | Change the default random seed for reproducibility.                   |
+| `--random_seeds`    | int[]   | None          | Optional list of seeds; repeats each run once per seed.               |
 | `--qtable_path`     | str     | None          | Path to a `.npy` file for loading the Q-table to perform evaluation.  |
 | `--print_metrics`   | int     | 30            | Metrics printing frequency.                                           | 
 | `--render`          | bool    | False         | If `True`, renders the environment visually.                          |
+| `--experiments_dir` | str     | ""            | If provided, runs all `*-params-X.json` experiments in that directory in ascending `X`. |
 
 **Example: Training run**
 
@@ -74,6 +76,22 @@ The **qtable** will be automatically put in the `./runs/weights` folder.
 
 ```bash
 python slime_iql.py --random_seed 99 --qtable_path ./runs/weights/file_name.npy --render True
+```
+
+**Example: Sequential experiments from `experiments/`**
+
+If files like `env-params-1.json`, `env-params-2.json`, `learning-params-2.json` are present,
+the script runs experiments `1`, then `2`, and for each missing config type it falls back to defaults.
+
+```bash
+python slime_iql.py --train True --experiments_dir experiments
+```
+
+**Example: Repeat with multiple seeds**
+
+```bash
+python slime_iql.py --train True --random_seeds 10 20 30
+python slime_iql.py --train True --experiments_dir experiments --random_seeds 10 20 30
 ```
 
 ### Deterministic Policy

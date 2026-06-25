@@ -139,7 +139,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--params_path",
         type=str,
-        default="environments/slime/config/env-params.json",
+        default="environments/slime/config/env-params-1.json",
         required=False
     )
     
