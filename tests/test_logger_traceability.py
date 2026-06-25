@@ -39,6 +39,7 @@ class TestLoggerTraceability(unittest.TestCase):
             self.assertIn("exp_2_seed_99", logger.output_file)
             self.assertIn("exp_2_seed_99", logger.params_file)
             self.assertIn("exp_2_seed_99", logger.weights_file)
+            self.assertIn("exp_2_seed_99", os.path.basename(os.path.dirname(logger.output_file)))
             self.assertTrue(os.path.isfile(logger.params_file))
 
 

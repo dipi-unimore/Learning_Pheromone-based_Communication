@@ -94,6 +94,9 @@ python slime_iql.py --train True --random_seeds 10 20 30
 python slime_iql.py --train True --experiments_dir experiments --random_seeds 10 20 30
 ```
 
+If `--random_seeds` is provided, it is used as the source of seeds (even if it has a single element).
+If `--random_seeds` is not provided, the script falls back to `--random_seed` for backward compatibility.
+
 ### Deterministic Policy
     
 The main script is `slime_deterministic.py`, which accepts the following command-line arguments:
