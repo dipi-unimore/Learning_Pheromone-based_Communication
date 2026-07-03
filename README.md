@@ -38,6 +38,7 @@ This document details the code, parameters, and configurations used to obtain th
 Learning_Pheromone-based_Communication/
 ├── agents                      # Algorithms folder
 │   ├── IQLearning              # Indipendent Q-Learning implementation
+│   ├── CoQLearning             # Collaborative Q-Learning implementation
 │   │   └── config              # Algorithm configuration files
 │   ├── NoLearning              # Deterministic policy implementation
 │   └── utils                   # Utility functions
@@ -96,6 +97,111 @@ python slime_iql.py --train True --experiments_dir experiments --random_seeds 10
 
 If `--random_seeds` is provided, it is used as the source of seeds (even if it has a single element).
 If `--random_seeds` is not provided, the script falls back to `--random_seed` for backward compatibility.
+
+### CoQLearning
+
+The collaborative variant is exposed through `slime_coql.py` and keeps the same CLI surface as `slime_iql.py`.
+Its default learning configuration lives in `agents/CoQLearning/config/learning-params.json`.
+
+```bash
+python slime_coql.py --train True --random_seeds 10 20 30
+python slime_coql.py --train True --experiments_dir experiments --random_seeds 10 20 30
+```
+
+`agents/CoQLearning/config/learning-params.json` adds a `collaboration` block:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `true` | Enables collaborative updates during training. |
+| `share_every_steps` | `1` | Share information every N simulation ticks. |
+| `recipient_selector` | `"all"` | Share with `all`, `nearby`, or `similar` agents. |
+| `nearby_radius` | `1` | Toroidal square radius used when `recipient_selector="nearby"`. |
+| `share_rate` | `0.1` | Blend factor used by collaborative updates. |
+| `reward_weight` | `1.0` | Multiplier applied to shared rewards before shaping the update. |
+| `shared_information` | all `true` | Independently enables `observation`, `action`, `reward`, and `q_values` sharing. |
+
+To avoid exploding the tabular state space, CoQL does not append peer information to the observation.
+Instead, it uses compact summaries during the Q-update. The following subsections detail each integration strategy.
+
+#### A. Shared Observations
+
+When `shared_information.observation=true`, the recipient agent integrates peers' observations without enlarging the state space:
+
+1. Identify the observation state indices for each peer: $s_{\text{peer}_i} = \text{env.convert\_observation}(o_{\text{peer}_i})$
+2. **Look up the RECIPIENT's own Q-value row for each peer's observed state**: $Q_{\text{recipient}}(s_{\text{peer}_i}, \cdot)$  
+   (This is key: use the recipient's learned knowledge about what those states mean to *itself*.)
+3. Average the Q-rows across all peers: $\bar{Q}_{\text{shared}} = \frac{1}{|\text{peers}|} \sum_i Q_{\text{recipient}}(s_{\text{peer}_i}, \cdot)$
+4. Blend the shared Q-row with the recipient's current Q-row using the configured `share_rate`:
+   $$Q_{\text{recipient}}(s_{\text{recipient}}, \cdot) \leftarrow (1 - r_s) \cdot Q_{\text{recipient}}(s_{\text{recipient}}, \cdot) + r_s \cdot \bar{Q}_{\text{shared}}$$
+   where $r_s$ is the `share_rate`.
+
+**Intuition**: "What would I think about the states my peers are observing?" Uses only the recipient's own learned beliefs about those states, without being influenced by how peers value them. This is a more conservative form of generalization.
+
+#### B. Shared Actions
+
+When `shared_information.action=true`, the recipient integrates peers' behavioral history via majority voting:
+
+1. Collect all peers' previous actions (one per peer, if available) and current actions: $\mathcal{A}_{\text{shared}} = \{a_{\text{prev}}, a_{\text{curr}}\}$ per peer
+2. Compute the most frequent action in the pool: $a_{\text{majority}} = \text{argmax}_a |\{a' \in \mathcal{A}_{\text{shared}} : a' = a\}|$
+3. Increment the Q-value for that action in the recipient's current state by the `share_rate`:
+   $$Q_{\text{recipient}}(s_{\text{recipient}}, a_{\text{majority}}) \leftarrow Q_{\text{recipient}}(s_{\text{recipient}}, a_{\text{majority}}) + r_s$$
+
+**Intuition**: A small bonus nudges the recipient's policy toward actions that peers find useful, acting as a lightweight coordination pressure without distorting the learned value landscape.
+
+#### C. Shared Rewards
+
+When `shared_information.reward=true`, the recipient shapes its Q-update using peers' reward signals:
+
+1. Compute the average peer reward: $\bar{r}_{\text{shared}} = \frac{1}{|\text{peers}|} \sum_i r_i$
+2. Scale the shared reward by the configured `reward_weight`: $r_{\text{shaped}} = w_r \cdot \bar{r}_{\text{shared}}$ (default $w_r = 1.0$)
+3. Form a shaped TD target using the shared reward:
+   $$\bar{Q}(s_{\text{recipient}}) = (1 - \alpha) \cdot Q(s_{\text{recipient}}, a_{\text{recipient}}) + \alpha \cdot (r_{\text{shaped}} + \gamma \cdot \max_a Q(s_{\text{recipient}}, a))$$
+4. Blend the shaped target with the recipient's current Q-value:
+   $$Q_{\text{recipient}}(s_{\text{recipient}}, a_{\text{recipient}}) \leftarrow (1 - r_s) \cdot Q(s_{\text{recipient}}, a_{\text{recipient}}) + r_s \cdot \bar{Q}(s_{\text{recipient}})$$
+
+**Intuition**: Peers' successes and failures (encoded in their rewards) can guide the recipient's exploration by offering alternative value signals. The `reward_weight` lets you scale how much external rewards influence your own learning.
+
+#### D. Shared Q-Values
+
+When `shared_information.q_values=true`, the recipient directly fuses peers' learned knowledge:
+
+1. For each peer, identify its current observation state: $s_{\text{peer}_i}$
+2. **Retrieve each PEER's Q-value row for that peer's state**: $Q_{\text{peer}_i}(s_{\text{peer}_i}, \cdot)$  
+   (This is key: use each peer's own learned estimates, not the recipient's.)
+3. Average the peers' Q-rows:
+   $$\bar{Q}_{\text{consensus}} = \frac{1}{|\text{peers}|} \sum_i Q_{\text{peer}_i}(s_{\text{peer}_i}, \cdot)$$
+4. Blend the consensus row directly into the recipient's current-state Q-values:
+   $$Q_{\text{recipient}}(s_{\text{recipient}}, \cdot) \leftarrow (1 - r_s) \cdot Q_{\text{recipient}}(s_{\text{recipient}}, \cdot) + r_s \cdot \bar{Q}_{\text{consensus}}$$
+
+**Intuition**: This is the strongest form of collaboration, acting as a distributed consensus mechanism. Peers vote on action values using **their own learned estimates**, allowing the recipient to benefit from the exploration and learning progress of others. This is more aggressive than A because it directly adopts peers' value judgments.
+
+---
+
+**Comparison: Why A and D are Different**
+
+Sections A and D use structurally identical blending but consult **different Q-tables**:
+
+| Aspect | A (Shared Observations) | D (Shared Q-Values) |
+|--------|----------------------|-------------------|
+| **What is averaged?** | Recipient's Q-values at peer-observed states | Peers' own Q-values at their own states |
+| **Formula** | $\frac{1}{n}\sum_i Q_{\text{recipient}}(s_{\text{peer}_i}, \cdot)$ | $\frac{1}{n}\sum_i Q_{\text{peer}_i}(s_{\text{peer}_i}, \cdot)$ |
+| **Information source** | Recipient's internalized model | Peers' learned experiences |
+| **Risk** | Self-reinforcing if recipient has incorrect beliefs | May adopt peers' bad habits if they're coherently wrong |
+| **Best used when** | You trust your own learning and want to generalize to peer observations | You want to explicitly transfer knowledge from peers |
+
+**Example**: Suppose a recipient agent and peer observe the **same state**  ($s_{\text{recipient}} = s_{\text{peer}}$), but are at **different positions**:
+- **A**: The recipient asks "What does *I* think about this state?" and uses my own Q-values.
+- **D**: The recipient asks "What does *my peer* think about this state?" and uses the peer's Q-values.
+
+If the peer has explored more and learned better, **D** will bootstrap the recipient toward the peer's policy. If the recipient wants to stay true to its own learning, **A** is more conservative.
+
+---
+
+**General notes on integration:**
+- All integrations use a **per-step Q-table snapshot** to avoid order-dependent artifacts. Each collaborative step reads from the Q-table as it existed at tick $t$, not including updates made earlier in the same tick.
+- The `share_every_steps` parameter controls the frequency: sharing happens when `tick % share_every_steps == 0`.
+- The `recipient_selector` determines which peers contribute (see sections below).
+- All sharing is **disabled during evaluation** (test phase).
 
 ### Deterministic Policy
     
@@ -167,6 +273,8 @@ The following .json configuration files are used to manage the experiment's para
 |`/environments/slime/config/env_visualizer.json` |	Controls the rendering configuration for visualizing the environment|
 |`/agent/IQLearning/config/learning-params.json` |	Contains learning-related parameters such as learning rate, epsilon decay, etc.|
 |`/agent/IQLearning/config/logger-params.json` |	Configures the logging behavior and export mode.|
+|`/agent/CoQLearning/config/learning-params.json` |	Contains collaborative learning settings such as what, when, and with whom agents share information.|
+|`/agent/CoQLearning/config/logger-params.json` |	Configures the logging behavior for CoQL runs.|
 
 ---
 
