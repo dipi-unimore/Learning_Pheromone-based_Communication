@@ -1,7 +1,7 @@
 import collections
 import itertools
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -97,7 +97,12 @@ def _select_recipient_agents(
     """
 
     selector = collaboration["recipient_selector"]
-    peer_ids = [agent_id for agent_id in step_info.keys() if agent_id != recipient_id]
+    recipient_mode = env.learners[recipient_id]["mode"]
+    peer_ids = [
+        agent_id
+        for agent_id in step_info.keys()
+        if agent_id != recipient_id and env.learners[agent_id]["mode"] == recipient_mode
+    ]
 
     if selector == "all":
         return peer_ids

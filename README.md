@@ -201,6 +201,7 @@ If the peer has explored more and learned better, **D** will bootstrap the recip
 - All integrations use a **per-step Q-table snapshot** to avoid order-dependent artifacts. Each collaborative step reads from the Q-table as it existed at tick $t$, not including updates made earlier in the same tick.
 - The `share_every_steps` parameter controls the frequency: sharing happens when `tick % share_every_steps == 0`.
 - The `recipient_selector` determines which peers contribute (see sections below).
+- Regardless of `recipient_selector`, information is shared **only among agents of the same kind**: cluster agents (`env.learners[*]["mode"] == "c"`) share only with cluster agents, and scatter agents (`env.learners[*]["mode"] == "s"`) share only with scatter agents.
 - All sharing is **disabled during evaluation** (test phase).
 
 ### Deterministic Policy
