@@ -13,6 +13,15 @@ def train(
     logger_params_path: str,
     run_tag: str,
 ) -> Dict[str, Any]:
+    """
+    Train MAPPO via EpyMARL using direct API (if available) or subprocess.
+
+    Returns result dict with:
+    - method: 'direct_api' or 'subprocess'
+    - command: executed command or method string
+    - returncode: execution exit code (0 = success)
+    - stdout/stderr: output streams
+    """
     return run_epymarl_command(
         l_params=l_params,
         algorithm=ALGORITHM_NAME,
@@ -33,6 +42,11 @@ def eval(
     logger_params_path: str,
     run_tag: str,
 ) -> Dict[str, Any]:
+    """
+    Evaluate MAPPO via EpyMARL using direct API (if available) or subprocess.
+
+    Returns result dict with execution metadata (method, command, returncode, stdout, stderr).
+    """
     return run_epymarl_command(
         l_params=l_params,
         algorithm=ALGORITHM_NAME,

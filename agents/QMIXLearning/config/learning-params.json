@@ -2,6 +2,8 @@
     "train_episodes": 3000,
     "test_episodes": 100,
     "epymarl": {
+        "use_direct_api": true,
+        "force_subprocess": false,
         "command_template_train": "__SET_ME__",
         "command_template_eval": "__SET_ME__"
     }

@@ -67,13 +67,19 @@ def _run_once(args, runner) -> None:
             run_tag=run_tag,
         )
 
-    print(f"Executed command: {result['command']}")
+    # Report execution method (direct API vs subprocess)
+    method = result.get("method", "unknown")
+    print(f"\n[EXECUTION METHOD] {method.upper()}")
+    print(f"Command: {result['command']}")
     if result["stdout"]:
-        print(result["stdout"])
+        print(f"STDOUT:\n{result['stdout']}")
     if result["stderr"]:
-        print(result["stderr"])
+        print(f"STDERR:\n{result['stderr']}")
     if result["returncode"] != 0:
-        raise RuntimeError(f"[ERROR] EpyMARL command failed with return code {result['returncode']}")
+        raise RuntimeError(
+            f"[ERROR] EpyMARL execution failed with return code {result['returncode']} "
+            f"(method: {method})"
+        )
 
 
 def run_experiments_sequence(args, runner) -> None:

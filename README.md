@@ -206,7 +206,7 @@ If the peer has explored more and learned better, **D** will bootstrap the recip
 
 ### QMIX and MAPPO (EpyMARL)
 
-Two additional scripts mirror the same experiment orchestration (single run, `experiments/` batching, and `--random_seeds`) for EpyMARL:
+Two additional scripts mirror the same experiment orchestration (single run, `experiments/` batching, and `--random_seeds`) for EpyMARL-based algorithms:
 - `slime_qmix.py`
 - `slime_mappo.py`
 
@@ -214,29 +214,109 @@ Related module/config folders mimic `CoQLearning`:
 - `agents/QMIXLearning/`
 - `agents/MAPPOLearning/`
 
-Each learning config has an `epymarl` block with command templates:
-- `command_template_train`
-- `command_template_eval`
+**Hybrid Execution Strategy:**
+Both scripts support two execution methods that automatically switch based on availability:
+
+1. **Direct Python API** (preferred if EpyMARL is installed)
+   - Imports and calls EpyMARL functions directly
+   - Lower latency, better integration
+   - Enabled by `use_direct_api: true` in learning config
+
+2. **Subprocess-based** (fallback for CLI installations)
+   - Spawns EpyMARL via configured command templates
+   - More flexible, works with any EpyMARL installation
+   - Falls back automatically if direct API unavailable
+
+Each learning config has an `epymarl` block controlling execution:
+- `use_direct_api` (default: `true`) — Try direct Python API first
+- `force_subprocess` (default: `false`) — Force subprocess-only mode
+- `command_template_train` — Command template for training (required for subprocess fallback)
+- `command_template_eval` — Command template for evaluation (required for subprocess fallback)
 
 Supported template placeholders are:
 `{algorithm}`, `{seed}`, `{env_params_path}`, `{learning_params_path}`, `{logger_params_path}`, `{run_tag}`.
 
-Defaults are set to `__SET_ME__` on purpose so the project does not assume a specific EpyMARL CLI entrypoint.
-Set the templates to your local EpyMARL commands, then run for example:
+**CLI Usage** (identical to CoQL):
 
 ```bash
+# Single run with specific seed
+python slime_qmix.py --train True --random_seed 99
+
+# Multi-seed repetition
 python slime_qmix.py --train True --random_seeds 10 20 30
+
+# Sequential experiments from directory
+python slime_mappo.py --train True --experiments_dir experiments
+
+# Combined: multiple seeds over batched experiments
 python slime_mappo.py --train True --experiments_dir experiments --random_seeds 10 20 30
+
+# Evaluation
+python slime_qmix.py --train False --random_seed 99
 ```
 
-#### EpyMARL Command Templates
+#### Execution Methods
 
-Below are common ready-to-copy template examples. Choose one based on your EpyMARL installation and update your `learning-params.json`.
+**A. Direct Python API (Default)**
+
+If EpyMARL is installed as a Python package and `use_direct_api=true`, the system will call EpyMARL functions directly:
+
+```json
+"epymarl": {
+  "use_direct_api": true,
+  "force_subprocess": false,
+  "command_template_train": "__SET_ME__",
+  "command_template_eval": "__SET_ME__"
+}
+```
+
+When direct API is used:
+- No command templates required (they are ignored)
+- Execution output will show `[EXECUTION METHOD] DIRECT_API`
+- Lower latency and better error reporting
+
+Example detection:
+```bash
+python slime_qmix.py --train True --random_seed 10
+# Output: [EXECUTION METHOD] DIRECT_API
+# Command: direct_api:qmix
+```
+
+**B. Subprocess-based (Fallback or Explicit)**
+
+If EpyMARL only provides CLI/script-based entry points, or to force subprocess:
+
+```json
+"epymarl": {
+  "use_direct_api": false,
+  "force_subprocess": true,
+  "command_template_train": "cd /path/to/pymarl && python src/main.py --config={algorithm} ...",
+  "command_template_eval": "cd /path/to/pymarl && python src/main.py --config={algorithm}_eval ..."
+}
+```
+
+When subprocess is used:
+- Execution output will show `[EXECUTION METHOD] SUBPROCESS`
+- Command and all output streams are captured
+- Returns exit code from subprocess
+
+Example detection:
+```bash
+python slime_qmix.py --train True --random_seed 10
+# Output: [EXECUTION METHOD] SUBPROCESS
+# Command: cd /path/to/pymarl && python src/main.py --config=qmix ...
+```
+
+#### EpyMARL Command Template Examples
+
+Below are ready-to-copy templates for common EpyMARL setups (used only if subprocess mode is active).
 
 **A. Local PyMARL (run.py entrypoint)**
 
 ```json
 "epymarl": {
+  "use_direct_api": false,
+  "force_subprocess": true,
   "command_template_train": "cd /path/to/pymarl && python src/main.py --config={algorithm} --env-config=slime with env_args.seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path}",
   "command_template_eval": "cd /path/to/pymarl && python src/main.py --config={algorithm}_qmix_eval --env-config=slime with env_args.seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path} checkpoint_path_load={run_tag}"
 }
@@ -246,6 +326,8 @@ Below are common ready-to-copy template examples. Choose one based on your EpyMA
 
 ```json
 "epymarl": {
+  "use_direct_api": false,
+  "force_subprocess": true,
   "command_template_train": "cd /path/to/epymarl && python run.py --config=qmix --env-config=slime with seed={seed} env.seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path}",
   "command_template_eval": "cd /path/to/epymarl && python run.py --config=qmix --env-config=slime with seed={seed} env.seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path} checkpoint_path={run_tag}"
 }
@@ -255,6 +337,8 @@ Below are common ready-to-copy template examples. Choose one based on your EpyMA
 
 ```json
 "epymarl": {
+  "use_direct_api": false,
+  "force_subprocess": true,
   "command_template_train": "docker run --rm -v /path/to/experiments:/experiments my-epymarl-image python run.py --config={algorithm} --env-config=slime with seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path}",
   "command_template_eval": "docker run --rm -v /path/to/experiments:/experiments my-epymarl-image python run.py --config={algorithm}_eval --env-config=slime with seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path} load_checkpoint={run_tag}"
 }
@@ -264,12 +348,14 @@ Below are common ready-to-copy template examples. Choose one based on your EpyMA
 
 ```json
 "epymarl": {
+  "use_direct_api": false,
+  "force_subprocess": true,
   "command_template_train": "ssh user@remote-server 'cd ~/epymarl && python run.py --config={algorithm} --env-config=slime with seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path}'",
   "command_template_eval": "ssh user@remote-server 'cd ~/epymarl && python run.py --config={algorithm} --env-config=slime with seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path} checkpoint={run_tag}'"
 }
 ```
 
-**Template Placeholders:**
+**Template Placeholders (subprocess only):**
 - `{algorithm}` → replaced with the algorithm name (`qmix` or `mappo`)
 - `{seed}` → random seed (e.g., 10, 20, 30)
 - `{env_params_path}` → absolute path to environment config JSON
@@ -278,9 +364,12 @@ Below are common ready-to-copy template examples. Choose one based on your EpyMA
 - `{run_tag}` → experiment run identifier for checkpoints
 
 **Tips:**
-- Ensure all paths are absolute to avoid working directory issues.
-- Test with `--train True --random_seeds 10` first to verify your templates work.
+- **Direct API preferred**: If EpyMARL is installed as `import pymarl`, the system will use direct API automatically.
+- **Subprocess fallback**: If direct API isn't available or you set `force_subprocess=true`, use command templates.
+- Ensure all paths in templates are absolute to avoid working directory issues.
+- Test with `--train True --random_seeds 10` first to verify your setup.
 - Capture EpyMARL logs by redirecting output: `>> {run_tag}_train.log 2>&1` in the template.
+- The execution method used (direct API vs subprocess) is always printed to console.
 
 ### Deterministic Policy
     
