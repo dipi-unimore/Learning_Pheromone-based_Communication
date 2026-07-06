@@ -204,6 +204,84 @@ If the peer has explored more and learned better, **D** will bootstrap the recip
 - Regardless of `recipient_selector`, information is shared **only among agents of the same kind**: cluster agents (`env.learners[*]["mode"] == "c"`) share only with cluster agents, and scatter agents (`env.learners[*]["mode"] == "s"`) share only with scatter agents.
 - All sharing is **disabled during evaluation** (test phase).
 
+### QMIX and MAPPO (EpyMARL)
+
+Two additional scripts mirror the same experiment orchestration (single run, `experiments/` batching, and `--random_seeds`) for EpyMARL:
+- `slime_qmix.py`
+- `slime_mappo.py`
+
+Related module/config folders mimic `CoQLearning`:
+- `agents/QMIXLearning/`
+- `agents/MAPPOLearning/`
+
+Each learning config has an `epymarl` block with command templates:
+- `command_template_train`
+- `command_template_eval`
+
+Supported template placeholders are:
+`{algorithm}`, `{seed}`, `{env_params_path}`, `{learning_params_path}`, `{logger_params_path}`, `{run_tag}`.
+
+Defaults are set to `__SET_ME__` on purpose so the project does not assume a specific EpyMARL CLI entrypoint.
+Set the templates to your local EpyMARL commands, then run for example:
+
+```bash
+python slime_qmix.py --train True --random_seeds 10 20 30
+python slime_mappo.py --train True --experiments_dir experiments --random_seeds 10 20 30
+```
+
+#### EpyMARL Command Templates
+
+Below are common ready-to-copy template examples. Choose one based on your EpyMARL installation and update your `learning-params.json`.
+
+**A. Local PyMARL (run.py entrypoint)**
+
+```json
+"epymarl": {
+  "command_template_train": "cd /path/to/pymarl && python src/main.py --config={algorithm} --env-config=slime with env_args.seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path}",
+  "command_template_eval": "cd /path/to/pymarl && python src/main.py --config={algorithm}_qmix_eval --env-config=slime with env_args.seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path} checkpoint_path_load={run_tag}"
+}
+```
+
+**B. EpyMARL with run.py (alternative structure)**
+
+```json
+"epymarl": {
+  "command_template_train": "cd /path/to/epymarl && python run.py --config=qmix --env-config=slime with seed={seed} env.seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path}",
+  "command_template_eval": "cd /path/to/epymarl && python run.py --config=qmix --env-config=slime with seed={seed} env.seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path} checkpoint_path={run_tag}"
+}
+```
+
+**C. Docker container execution**
+
+```json
+"epymarl": {
+  "command_template_train": "docker run --rm -v /path/to/experiments:/experiments my-epymarl-image python run.py --config={algorithm} --env-config=slime with seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path}",
+  "command_template_eval": "docker run --rm -v /path/to/experiments:/experiments my-epymarl-image python run.py --config={algorithm}_eval --env-config=slime with seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path} load_checkpoint={run_tag}"
+}
+```
+
+**D. Remote server (SSH execution)**
+
+```json
+"epymarl": {
+  "command_template_train": "ssh user@remote-server 'cd ~/epymarl && python run.py --config={algorithm} --env-config=slime with seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path}'",
+  "command_template_eval": "ssh user@remote-server 'cd ~/epymarl && python run.py --config={algorithm} --env-config=slime with seed={seed} env_args.env_params_path={env_params_path} env_args.learning_params_path={learning_params_path} checkpoint={run_tag}'"
+}
+```
+
+**Template Placeholders:**
+- `{algorithm}` → replaced with the algorithm name (`qmix` or `mappo`)
+- `{seed}` → random seed (e.g., 10, 20, 30)
+- `{env_params_path}` → absolute path to environment config JSON
+- `{learning_params_path}` → absolute path to learning config JSON
+- `{logger_params_path}` → absolute path to logger config JSON
+- `{run_tag}` → experiment run identifier for checkpoints
+
+**Tips:**
+- Ensure all paths are absolute to avoid working directory issues.
+- Test with `--train True --random_seeds 10` first to verify your templates work.
+- Capture EpyMARL logs by redirecting output: `>> {run_tag}_train.log 2>&1` in the template.
+
 ### Deterministic Policy
     
 The main script is `slime_deterministic.py`, which accepts the following command-line arguments:
@@ -276,6 +354,10 @@ The following .json configuration files are used to manage the experiment's para
 |`/agent/IQLearning/config/logger-params.json` |	Configures the logging behavior and export mode.|
 |`/agent/CoQLearning/config/learning-params.json` |	Contains collaborative learning settings such as what, when, and with whom agents share information.|
 |`/agent/CoQLearning/config/logger-params.json` |	Configures the logging behavior for CoQL runs.|
+|`/agents/QMIXLearning/config/learning-params.json` |	Contains EpyMARL command templates and run options for QMIX.|
+|`/agents/QMIXLearning/config/logger-params.json` |	Provides run metadata naming defaults for QMIX experiments.|
+|`/agents/MAPPOLearning/config/learning-params.json` |	Contains EpyMARL command templates and run options for MAPPO.|
+|`/agents/MAPPOLearning/config/logger-params.json` |	Provides run metadata naming defaults for MAPPO experiments.|
 
 ---
 
@@ -299,4 +381,5 @@ If you use this codebase in your research, please cite the following article:
 
 > **XXX** 
 > Authors: Davide Borghi, Stefano Mariani, and Franco Zambonelli  
-> XXX 
+> XXX
+
