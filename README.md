@@ -251,12 +251,14 @@ python slime_qmix.py --train True --experiments_dir experiments --random_seeds 1
 
 ### QMIXLearningNN
 
-`slime_qmix_nn.py` is a neural-network variant of QMIX implemented with pure NumPy, so it does not add any new dependency.
+`slime_qmix_nn.py` is a neural-network variant of QMIX implemented with **PyTorch**.
 
 It keeps the same CLI and experiment batching style as the other runners, but uses:
-- a small per-agent MLP instead of a tabular Q-table
-- a learned mixing network that consumes a concatenated global state encoding
-- flat `.npy` model serialization for compatibility with the current `Logger`
+- per-agent Q-networks (MLPs) and a QMIX mixer network
+- **Alternative C** training: replay buffer + mini-batch updates + target networks
+- **Double-Q style** target computation (online selects actions, target evaluates)
+- `device` auto-selection for CUDA/MPS/CPU
+- flat `.npy` serialization via `Logger` (Option A compatibility path)
 
 ```bash
 python slime_qmix_nn.py --train True --random_seed 99
@@ -279,8 +281,38 @@ python slime_qmix_nn.py --train True --experiments_dir experiments --random_seed
 | `agent_hidden_dim` | `32` | Hidden layer width for each agent MLP |
 | `mixer_hidden_dim` | `32` | Hidden layer width for the mixer hypernetwork |
 | `mixer_learning_rate` | `0.001` | Learning rate for the mixing network |
+| `device` | `"auto"` | Accepted values: `"auto"`, `"cpu"`, `"cuda"`, `"cuda:N"`, `"mps"`. `"auto"` tries CUDA, then MPS, then CPU. |
+| `replay_capacity` | `10000` | Max number of transitions stored in replay memory. |
+| `batch_size` | `64` | Number of transitions sampled per gradient update. |
+| `learning_starts` | `256` | Minimum replay size before starting gradient updates. |
+| `train_every` | `1` | Perform one training update every N environment steps. |
+| `target_update_mode` | `"hard"` | Target sync mode: `"hard"` (periodic copy) or `"soft"` (Polyak averaging). |
+| `target_update_interval` | `200` | In `"hard"` mode, copy online -> target every N gradient steps. |
+| `tau` | `0.01` | In `"soft"` mode, Polyak coefficient for target updates. |
 
 The NN variant is intentionally additive: `slime_qmix.py` still uses the tabular QMIX implementation, while `slime_qmix_nn.py` provides the neural version.
+
+For a deeper explanation of the Alternative C design decisions, see `QMIX_NN_ALTERNATIVE_C_EXPLANATION.md`.
+
+**Selected design options for QMIX-NN:**
+- **Option C**: replay buffer + mini-batch + target networks (deep-RL training path)
+- **Option A**: keep `.npy` checkpoint compatibility with the current `Logger` via model pack/unpack
+- **Double-Q style**: online network selects next actions, target network evaluates them
+
+**Example: training and evaluation**
+
+```bash
+python slime_qmix_nn.py --train True --random_seed 99
+python slime_qmix_nn.py --train False --qtable_path ./runs/weights/qmix_nn_train_weights_*.npy --random_seed 99
+```
+
+**Example: force GPU (if available in your PyTorch install)**
+
+Set `"device": "cuda"` in `agents/QMIXLearningNN/config/learning-params.json`, then run:
+
+```bash
+python slime_qmix_nn.py --train True --random_seed 99
+```
 
 ---
 

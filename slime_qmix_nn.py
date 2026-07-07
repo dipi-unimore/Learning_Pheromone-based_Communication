@@ -55,6 +55,7 @@ def main(args) -> None:
         (
             agent_nets,
             mixer,
+            device,
             agent_lr,
             mixer_lr,
             gamma,
@@ -88,6 +89,7 @@ def main(args) -> None:
         (
             agent_nets,
             mixer,
+            device,
             test_episodes,
             cluster_dict,
             cluster_actions_dict,
@@ -148,7 +150,7 @@ def check_args(args) -> bool:
         path = getattr(args, path_name)
         assert path and os.path.isfile(path) and path.endswith(".json"), f"[ERROR] {path_name} is empty or is not a json file"
     if args.qtable_path is not None:
-        assert args.qtable_path.endswith((".npy", ".pt")), "[ERROR] model weights file must be a .npy or .pt file"
+        assert args.qtable_path.endswith(".npy"), "[ERROR] model weights file must be a .npy file"
     return True
 
 

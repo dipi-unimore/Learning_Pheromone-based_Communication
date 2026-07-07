@@ -260,7 +260,7 @@ class TestCreateAgent(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestSerialization(unittest.TestCase):
-    def test_save_load_round_trip_preserves_predictions(self):
+    def test_pack_unpack_round_trip_preserves_predictions(self):
         agent_nets, mixer, device, *_ = qmix_nn.create_agent(
             _DEFAULT_PARAMS, _DEFAULT_L_PARAMS, 3, 2, train=True
         )
@@ -269,23 +269,17 @@ class TestSerialization(unittest.TestCase):
         q_before = agent_nets[0].predict(state).copy()
         qtotal_before = mixer.predict(gs, np.array([q_before[0]], dtype=np.float32))
 
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            tmp = f.name
-        try:
-            qmix_nn.save_model(agent_nets, mixer, tmp)
-            # Load into fresh networks
-            new_nets, new_mixer, new_dev, *_ = qmix_nn.create_agent(
-                _DEFAULT_PARAMS, _DEFAULT_L_PARAMS, 3, 2, train=True
-            )
-            qmix_nn.load_model(new_nets, new_mixer, tmp, new_dev)
+        packed = qmix_nn.pack_model(agent_nets, mixer)
+        new_nets, new_mixer, *_ = qmix_nn.create_agent(
+            _DEFAULT_PARAMS, _DEFAULT_L_PARAMS, 3, 2, train=True
+        )
+        qmix_nn.unpack_model(packed, new_nets, new_mixer)
 
-            q_after = new_nets[0].predict(state)
-            qtotal_after = new_mixer.predict(gs, np.array([q_after[0]], dtype=np.float32))
+        q_after = new_nets[0].predict(state)
+        qtotal_after = new_mixer.predict(gs, np.array([q_after[0]], dtype=np.float32))
 
-            np.testing.assert_allclose(q_before, q_after, rtol=1e-5)
-            self.assertAlmostEqual(qtotal_before, qtotal_after, places=5)
-        finally:
-            os.unlink(tmp)
+        np.testing.assert_allclose(q_before, q_after, rtol=1e-5)
+        self.assertAlmostEqual(qtotal_before, qtotal_after, places=5)
 
     def test_checkpoint_has_expected_keys(self):
         agent_nets, mixer, *_ = qmix_nn.create_agent(
@@ -454,30 +448,45 @@ class TestTrainEvalSmoke(unittest.TestCase):
         # First train briefly to get networks
         agent_nets, mixer, device, *_ = self._create_train_args()
 
-        # Save and reload
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            tmp = f.name
-        try:
-            qmix_nn.save_model(agent_nets, mixer, tmp)
+        packed = qmix_nn.pack_model(agent_nets, mixer)
 
-            (
-                eval_nets, eval_mixer, eval_dev,
-                test_episodes,
-                cluster_dict, cluster_actions_dict, cluster_action_dict, cluster_reward_dict,
-                scatter_actions_dict, scatter_action_dict, scatter_reward_dict,
-            ) = qmix_nn.create_agent(_DEFAULT_PARAMS, _DEFAULT_L_PARAMS, 3, 2, train=False)
-            qmix_nn.load_model(eval_nets, eval_mixer, tmp, eval_dev)
+        (
+            eval_nets, eval_mixer, eval_dev,
+            test_episodes,
+            cluster_dict, cluster_actions_dict, cluster_action_dict, cluster_reward_dict,
+            scatter_actions_dict, scatter_action_dict, scatter_reward_dict,
+        ) = qmix_nn.create_agent(_DEFAULT_PARAMS, _DEFAULT_L_PARAMS, 3, 2, train=False)
+        qmix_nn.unpack_model(packed, eval_nets, eval_mixer)
 
-            qmix_nn.eval(
-                self.env, _DEFAULT_PARAMS,
-                cluster_dict, cluster_actions_dict, cluster_action_dict, cluster_reward_dict,
-                scatter_actions_dict, scatter_action_dict, scatter_reward_dict,
-                test_episodes, eval_nets, 1, self.logger, None,
-            )
-        finally:
-            os.unlink(tmp)
+        qmix_nn.eval(
+            self.env, _DEFAULT_PARAMS,
+            cluster_dict, cluster_actions_dict, cluster_action_dict, cluster_reward_dict,
+            scatter_actions_dict, scatter_action_dict, scatter_reward_dict,
+            test_episodes, eval_nets, 1, self.logger, None,
+        )
 
         self.assertTrue(self.logger.values)
+
+
+class TestDoubleQSelection(unittest.TestCase):
+    def test_double_q_uses_online_argmax_and_target_value(self):
+        online = qmix_nn.AgentQNetwork(3, 4, 2, learning_rate=0.01, device=torch.device("cpu"))
+        target = qmix_nn.AgentQNetwork(3, 4, 2, learning_rate=0.01, device=torch.device("cpu"))
+
+        # Force online to prefer action 0 and target to value action 1 higher.
+        with torch.no_grad():
+            for p in online.parameters():
+                p.zero_()
+            for p in target.parameters():
+                p.zero_()
+            # Last linear layer bias controls q-values when weights are zero.
+            online.network[2].bias.copy_(torch.tensor([2.0, 1.0]))
+            target.network[2].bias.copy_(torch.tensor([10.0, 20.0]))
+
+        next_obs = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+        chosen = qmix_nn._double_q_next_values(online, target, next_obs)
+        # Online chooses action 0; target evaluates action 0 -> 10.0
+        self.assertAlmostEqual(float(chosen.item()), 10.0, places=5)
 
 
 if __name__ == "__main__":

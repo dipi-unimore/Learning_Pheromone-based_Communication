@@ -189,6 +189,57 @@ def load_model(agent_nets: List[AgentQNetwork], mixer: QMIXMixer, path: str, dev
     mixer.load_state_dict(checkpoint["mixer"])
 
 
+def pack_model(agent_nets: List[AgentQNetwork], mixer: QMIXMixer) -> NDArray:
+    """
+    Pack all NN parameters into a flat float32 numpy vector.
+
+    This keeps compatibility with the existing Logger .npy save/load flow.
+    """
+    flat_parts: List[np.ndarray] = []
+    for net in agent_nets:
+        params = torch.cat([p.detach().cpu().view(-1) for p in net.parameters()]).numpy().astype(np.float32)
+        flat_parts.append(np.asarray([float(params.size)], dtype=np.float32))
+        flat_parts.append(params)
+
+    mixer_params = torch.cat([p.detach().cpu().view(-1) for p in mixer.parameters()]).numpy().astype(np.float32)
+    flat_parts.append(np.asarray([float(mixer_params.size)], dtype=np.float32))
+    flat_parts.append(mixer_params)
+
+    return np.concatenate(flat_parts).astype(np.float32)
+
+
+def unpack_model(flat_weights: NDArray, agent_nets: List[AgentQNetwork], mixer: QMIXMixer) -> None:
+    """
+    Restore model parameters from a flat vector produced by pack_model().
+    """
+    vec = np.asarray(flat_weights, dtype=np.float32).ravel()
+    offset = 0
+
+    for net in agent_nets:
+        count = int(vec[offset])
+        offset += 1
+        net_vec = vec[offset : offset + count]
+        offset += count
+        idx = 0
+        for p in net.parameters():
+            n = p.numel()
+            chunk = torch.from_numpy(net_vec[idx : idx + n]).to(device=net.device, dtype=p.dtype).view_as(p)
+            with torch.no_grad():
+                p.copy_(chunk)
+            idx += n
+
+    mixer_count = int(vec[offset])
+    offset += 1
+    mixer_vec = vec[offset : offset + mixer_count]
+    idx = 0
+    for p in mixer.parameters():
+        n = p.numel()
+        chunk = torch.from_numpy(mixer_vec[idx : idx + n]).to(device=mixer.device, dtype=p.dtype).view_as(p)
+        with torch.no_grad():
+            p.copy_(chunk)
+        idx += n
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -202,6 +253,23 @@ def _soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
     with torch.no_grad():
         for target_param, source_param in zip(target.parameters(), source.parameters()):
             target_param.data.mul_(1.0 - tau).add_(tau * source_param.data)
+
+
+def _double_q_next_values(
+    online_net: AgentQNetwork,
+    target_net: AgentQNetwork,
+    next_obs_t: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Double-Q target helper:
+    - select argmax action with online network
+    - evaluate that action with target network
+    """
+    with torch.no_grad():
+        online_next = online_net(next_obs_t)
+        next_actions = online_next.argmax(dim=1, keepdim=True)
+        target_next = target_net(next_obs_t)
+        return target_next.gather(1, next_actions).squeeze(1)
 
 
 def _build_tracking_dicts(params: Dict, episodes: int, n_actions: int) -> Tuple:
@@ -335,7 +403,6 @@ def _sample_and_update(
     batch_size: int,
     n_agents: int,
     n_obs: int,
-    n_actions: int,
     gamma: float,
     device: torch.device,
     agent_nets: List[AgentQNetwork],
@@ -370,10 +437,10 @@ def _sample_and_update(
         q_i_selected = q_i.gather(1, actions_t[:, i].unsqueeze(1)).squeeze(1)  # [B]
         online_selected_qs.append(q_i_selected)
 
-        with torch.no_grad():
-            q_next_i = target_agent_nets[i](next_obs_i)                   # [B, n_actions]
-            q_next_i_max = q_next_i.max(dim=1).values                     # [B]
-            target_next_max_qs.append(q_next_i_max)
+        # Double-Q target:
+        # action from online net, value from target net
+        q_next_i_double = _double_q_next_values(agent_nets[i], target_agent_nets[i], next_obs_i)
+        target_next_max_qs.append(q_next_i_double)
 
     online_selected_qs_t = torch.stack(online_selected_qs, dim=1)         # [B, n_agents]
     target_next_max_qs_t = torch.stack(target_next_max_qs, dim=1)         # [B, n_agents]
@@ -543,7 +610,6 @@ def train(
                         batch_size=batch_size,
                         n_agents=n_agents,
                         n_obs=n_obs,
-                        n_actions=n_actions,
                         gamma=gamma,
                         device=device,
                         agent_nets=agent_nets,
