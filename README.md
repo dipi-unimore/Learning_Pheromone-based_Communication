@@ -37,11 +37,13 @@ This document details the code, parameters, and configurations used to obtain th
 ```plaintext
 Learning_Pheromone-based_Communication/
 ├── agents                      # Algorithms folder
-│   ├── IQLearning              # Indipendent Q-Learning implementation
-│   ├── CoQLearning             # Collaborative Q-Learning implementation
-│   │   └── config              # Algorithm configuration files
-│   ├── NoLearning              # Deterministic policy implementation
-│   └── utils                   # Utility functions
+│   ├── IQLearning              # Indipendent Q-Learning implementation
+│   ├── CoQLearning             # Collaborative Q-Learning implementation
+│   │   └── config              # Algorithm configuration files
+│   ├── QMIXLearning            # QMIX (Value Decomposition) implementation
+│   │   └── config              # Algorithm configuration files
+│   ├── NoLearning              # Deterministic policy implementation
+│   └── utils                   # Utility functions
 └── environments                # Multi-agent environments
     └── slime                   # Slime environment
         └── config              # Env configuration files 
@@ -204,6 +206,47 @@ If the peer has explored more and learned better, **D** will bootstrap the recip
 - Regardless of `recipient_selector`, information is shared **only among agents of the same kind**: cluster agents (`env.learners[*]["mode"] == "c"`) share only with cluster agents, and scatter agents (`env.learners[*]["mode"] == "s"`) share only with scatter agents.
 - All sharing is **disabled during evaluation** (test phase).
 
+### QMIXLearning
+
+QMIX (Value Decomposition Networks for Cooperative Multi-Agent Reinforcement Learning) decomposes the global Q-function into individual agent Q-functions and a learned mixing network.
+
+The main script is `slime_qmix.py` and accepts the same CLI arguments as `slime_coql.py`:
+
+```bash
+python slime_qmix.py --train True --random_seed 99
+python slime_qmix.py --train True --random_seeds 10 20 30
+python slime_qmix.py --train True --experiments_dir experiments --random_seeds 10 20 30
+```
+
+**QMIX-specific configuration** in `agents/QMIXLearning/config/learning-params.json`:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `alpha` | `0.025` | Learning rate for Q-table updates |
+| `gamma` | `0.9` | Discount factor |
+| `epsilon` | `1.0` | Initial exploration rate |
+| `epsilon_min` | `0.1` | Minimum exploration rate |
+| `decay_type` | `"log"` | Type of epsilon decay (`"log"` or `"linear"`) |
+| `decay` | `0.9987` | Decay rate parameter |
+| `train_episodes` | `3000` | Number of training episodes |
+| `test_episodes` | `100` | Number of evaluation episodes |
+| `mixing_learning_rate` | `0.025` | Learning rate for the mixing network |
+
+**Key differences from IQL/CoQL:**
+- Individual agents maintain their own Q-tables (like IQL) for decentralized execution
+- A learned mixing network aggregates individual Q-values during training: `Q_total = W * [Q_1, Q_2, ..., Q_n] + V`
+- The mixing network learns linear weights that favor good cooperative actions
+- Evaluation uses only the individual Q-tables (decentralized policy)
+
+**Algorithm outline:**
+1. Each agent selects actions using its own Q-table (ε-greedy)
+2. Individual Q-values are updated using standard Q-learning
+3. Mixing network combines individual Q-values into a global estimate
+4. Mixing network weights are updated using the global TD error
+5. This encourages agents to learn policies that work well when mixed together
+
+---
+
 ### Deterministic Policy
     
 The main script is `slime_deterministic.py`, which accepts the following command-line arguments:
@@ -276,8 +319,8 @@ The following .json configuration files are used to manage the experiment's para
 |`/agent/IQLearning/config/logger-params.json` |	Configures the logging behavior and export mode.|
 |`/agent/CoQLearning/config/learning-params.json` |	Contains collaborative learning settings such as what, when, and with whom agents share information.|
 |`/agent/CoQLearning/config/logger-params.json` |	Configures the logging behavior for CoQL runs.|
-
----
+|`/agents/QMIXLearning/config/learning-params.json` |	Contains Q-learning parameters and mixing network learning rate for QMIX.|
+|`/agents/QMIXLearning/config/logger-params.json` |	Provides run metadata naming defaults for QMIX experiments.|
 
 ## 📈 Evaluation Metrics
 
