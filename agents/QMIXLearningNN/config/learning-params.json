@@ -1,0 +1,22 @@
+{
+    "alpha": 0.001,
+    "gamma": 0.9,
+    "epsilon": 1.0,
+    "epsilon_min": 0.1,
+    "decay_type": "log",
+    "decay": 0.9987,
+    "train_episodes": 3000,
+    "test_episodes": 100,
+    "agent_hidden_dim": 32,
+    "mixer_hidden_dim": 32,
+    "mixer_learning_rate": 0.001,
+    "device": "auto",
+    "replay_capacity": 10000,
+    "batch_size": 64,
+    "learning_starts": 256,
+    "train_every": 1,
+    "target_update_mode": "hard",
+    "target_update_interval": 200,
+    "tau": 0.01
+}
+

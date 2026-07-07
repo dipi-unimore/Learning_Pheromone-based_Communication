@@ -42,6 +42,8 @@ Learning_Pheromone-based_Communication/
 │   │   └── config              # Algorithm configuration files
 │   ├── QMIXLearning            # QMIX (Value Decomposition) implementation
 │   │   └── config              # Algorithm configuration files
+│   ├── QMIXLearningNN          # Neural-network QMIX implementation
+│   │   └── config              # Algorithm configuration files
 │   ├── NoLearning              # Deterministic policy implementation
 │   └── utils                   # Utility functions
 └── environments                # Multi-agent environments
@@ -247,6 +249,41 @@ python slime_qmix.py --train True --experiments_dir experiments --random_seeds 1
 
 ---
 
+### QMIXLearningNN
+
+`slime_qmix_nn.py` is a neural-network variant of QMIX implemented with pure NumPy, so it does not add any new dependency.
+
+It keeps the same CLI and experiment batching style as the other runners, but uses:
+- a small per-agent MLP instead of a tabular Q-table
+- a learned mixing network that consumes a concatenated global state encoding
+- flat `.npy` model serialization for compatibility with the current `Logger`
+
+```bash
+python slime_qmix_nn.py --train True --random_seed 99
+python slime_qmix_nn.py --train True --random_seeds 10 20 30
+python slime_qmix_nn.py --train True --experiments_dir experiments --random_seeds 10 20 30
+```
+
+**QMIX-NN configuration** in `agents/QMIXLearningNN/config/learning-params.json`:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `alpha` | `0.001` | Learning rate for the per-agent neural networks |
+| `gamma` | `0.9` | Discount factor |
+| `epsilon` | `1.0` | Initial exploration rate |
+| `epsilon_min` | `0.1` | Minimum exploration rate |
+| `decay_type` | `"log"` | Type of epsilon decay (`"log"` or `"linear"`) |
+| `decay` | `0.9987` | Decay rate parameter |
+| `train_episodes` | `3000` | Number of training episodes |
+| `test_episodes` | `100` | Number of evaluation episodes |
+| `agent_hidden_dim` | `32` | Hidden layer width for each agent MLP |
+| `mixer_hidden_dim` | `32` | Hidden layer width for the mixer hypernetwork |
+| `mixer_learning_rate` | `0.001` | Learning rate for the mixing network |
+
+The NN variant is intentionally additive: `slime_qmix.py` still uses the tabular QMIX implementation, while `slime_qmix_nn.py` provides the neural version.
+
+---
+
 ### Deterministic Policy
     
 The main script is `slime_deterministic.py`, which accepts the following command-line arguments:
@@ -321,6 +358,8 @@ The following .json configuration files are used to manage the experiment's para
 |`/agent/CoQLearning/config/logger-params.json` |	Configures the logging behavior for CoQL runs.|
 |`/agents/QMIXLearning/config/learning-params.json` |	Contains Q-learning parameters and mixing network learning rate for QMIX.|
 |`/agents/QMIXLearning/config/logger-params.json` |	Provides run metadata naming defaults for QMIX experiments.|
+|`/agents/QMIXLearningNN/config/learning-params.json` |	Contains neural-network QMIX parameters and model sizes.|
+|`/agents/QMIXLearningNN/config/logger-params.json` |	Provides run metadata naming defaults for QMIX-NN experiments.|
 
 ## 📈 Evaluation Metrics
 
