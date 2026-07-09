@@ -5,8 +5,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# import agents.QMIXLearningNN.qmix_nn as qmix_nn
 
-_SPEC = importlib.util.spec_from_file_location("qmix_nn", Path(__file__).with_name("qmix_nn.py"))
+# _SPEC = importlib.util.spec_from_file_location("qmix_nn", Path(__file__).with_name("qmix_nn.py"))
+_SPEC = importlib.util.spec_from_file_location("qmix_nn", Path("agents/QMIXLearningNN/qmix_nn.py"))
 qmix_nn = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
 _SPEC.loader.exec_module(qmix_nn)
