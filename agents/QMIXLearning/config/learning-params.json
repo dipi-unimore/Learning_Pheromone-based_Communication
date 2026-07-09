@@ -7,6 +7,13 @@
     "decay": 0.9987,
     "train_episodes": 3000,
     "test_episodes": 100,
-    "mixing_learning_rate": 0.025
+    "mixing_learning_rate": 0.025,
+    "qmix_credit_assignment": {
+        "enabled": true,
+        "qtable_update_mode": "hybrid",
+        "mixed_td_strategy": "equal_share",
+        "local_td_weight": 1.0,
+        "mixed_td_weight": 1.0,
+        "update_mixer": true
+    }
 }
-

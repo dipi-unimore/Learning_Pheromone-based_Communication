@@ -210,7 +210,15 @@ If the peer has explored more and learned better, **D** will bootstrap the recip
 
 ### QMIXLearning
 
-QMIX (Value Decomposition Networks for Cooperative Multi-Agent Reinforcement Learning) decomposes the global Q-function into individual agent Q-functions and a learned mixing network.
+`QMIXLearning` implements a **tabular, QMIX-inspired cooperative learner** for the Slime environment.
+
+The implementation follows the centralized-training/decentralized-execution idea:
+
+- during execution, every learner selects actions from its own tabular Q-function;
+- during training, learners of the same kind can receive a shared TD signal computed by a same-kind mixing network;
+- cluster learners and scatter learners are never mixed together for learning updates.
+
+This implementation is different from `QMIXLearningNN`. In the neural-network version, PyTorch backpropagation sends the mixed TD loss through the mixer into the agent networks automatically. In the tabular version, the individual Q-functions are NumPy Q-tables, so there is no autograd path from the mixer back into the individual Q-values. For that reason, tabular QMIX explicitly defines how the same-mode mixed TD error is assigned back into the agents' Q-table entries.
 
 The main script is `slime_qmix.py` and accepts the same CLI arguments as `slime_coql.py`:
 
@@ -220,32 +228,417 @@ python slime_qmix.py --train True --random_seeds 10 20 30
 python slime_qmix.py --train True --experiments_dir experiments --random_seeds 10 20 30
 ```
 
-**QMIX-specific configuration** in `agents/QMIXLearning/config/learning-params.json`:
+#### Tabular mixer
+
+For each learner mode, the mixer is a simple linear tabular mixer:
+
+```text
+Q_total = W_a dot [Q_1, Q_2, ..., Q_n] + V_a
+```
+
+where:
+
+- `n` is the number of agents in the same-mode group;
+- `Q_i` is the selected Q-table value for same-mode agent `i`;
+- `W_a` is the mixer weight vector associated with action `a`;
+- `V_a` is an action-specific value baseline.
+
+The mixer is not used directly for evaluation-time action selection. During evaluation, each agent acts greedily from its own Q-table. However, when mixed-TD credit assignment is enabled, the mixer affects the Q-tables during training, and therefore affects the final decentralized policies indirectly.
+
+#### Training outline
+
+At each training step:
+
+1. Each learner observes its local state.
+2. If a previous state/action exists, the learner may receive a local tabular TD update.
+3. The learner selects an action using epsilon-greedy action selection from its own Q-table.
+4. After all learners have acted, the implementation groups learners by mode.
+5. For each mode independently:
+   - collect same-mode previous Q-values;
+   - collect same-mode previous actions;
+   - collect same-mode next-state max Q-values;
+   - sum same-mode rewards;
+   - compute a same-mode mixed TD target;
+   - update the same-mode mixer, if configured;
+   - optionally feed the same-mode mixed TD error back into the same-mode agents' Q-table entries.
+
+The local TD update is:
+
+```text
+local_td_error = reward_i + gamma * max_a Q_i(next_state_i, a) - Q_i(prev_state_i, prev_action_i)
+
+Q_i(prev_state_i, prev_action_i) +=
+    alpha * local_td_weight * local_td_error
+```
+
+The mixed TD update is:
+
+```text
+mode_td_error = same_mode_mixed_target - same_mode_mixed_q
+
+Q_i(prev_state_i, prev_action_i) +=
+    alpha * mixed_td_weight * credit_share_i * mode_td_error
+```
+
+The value of `credit_share_i` depends on the configured mixed-TD strategy.
+
+#### Configuration file
+
+Tabular QMIX uses:
+
+```text
+agents/QMIXLearning/config/learning-params.json
+```
+
+Recommended default configuration:
+
+```json
+{
+    "alpha": 0.025,
+    "gamma": 0.9,
+    "epsilon": 1.0,
+    "epsilon_min": 0.1,
+    "decay_type": "log",
+    "decay": 0.9987,
+    "train_episodes": 3000,
+    "test_episodes": 100,
+    "mixing_learning_rate": 0.025,
+    "qmix_credit_assignment": {
+        "enabled": true,
+        "qtable_update_mode": "hybrid",
+        "mixed_td_strategy": "equal_share",
+        "local_td_weight": 1.0,
+        "mixed_td_weight": 1.0,
+        "update_mixer": true,
+        "weight_epsilon": 1e-12
+    }
+}
+```
+
+Use `mixing_learning_rate` for tabular QMIX. Do **not** rename it to `mixer_learning_rate`; `mixer_learning_rate` is used by the neural-network QMIX implementation.
+
+The `qmix_credit_assignment` block is specific to tabular QMIX. Do **not** add it to the neural-network QMIX configuration.
+
+#### Base learning parameters
 
 | Field | Default | Description |
-|-------|---------|-------------|
-| `alpha` | `0.025` | Learning rate for Q-table updates |
-| `gamma` | `0.9` | Discount factor |
-| `epsilon` | `1.0` | Initial exploration rate |
-| `epsilon_min` | `0.1` | Minimum exploration rate |
-| `decay_type` | `"log"` | Type of epsilon decay (`"log"` or `"linear"`) |
-| `decay` | `0.9987` | Decay rate parameter |
-| `train_episodes` | `3000` | Number of training episodes |
-| `test_episodes` | `100` | Number of evaluation episodes |
-| `mixing_learning_rate` | `0.025` | Learning rate for the mixing network |
+|---|---:|---|
+| `alpha` | `0.025` | Base Q-table learning rate. It scales both local TD updates and mixed-TD credit-assignment updates. |
+| `gamma` | `0.9` | Discount factor used in local and mixed TD targets. |
+| `epsilon` | `1.0` | Initial exploration rate for epsilon-greedy action selection. |
+| `epsilon_min` | `0.1` | Minimum exploration rate. |
+| `decay_type` | `"log"` | Type of epsilon decay. Supported values are `"log"` and `"linear"`. |
+| `decay` | `0.9987` | Epsilon decay parameter. |
+| `train_episodes` | `3000` | Number of training episodes. |
+| `test_episodes` | `100` | Number of evaluation episodes. |
+| `mixing_learning_rate` | `0.025` | Learning rate for the same-mode tabular mixers. This is meaningful only when `qmix_credit_assignment.update_mixer` is `true`. |
 
-**Key differences from IQL/CoQL:**
-- Individual agents maintain their own Q-tables (like IQL) for decentralized execution
-- A learned mixing network aggregates individual Q-values during training: `Q_total = W * [Q_1, Q_2, ..., Q_n] + V`
-- The mixing network learns linear weights that favor good cooperative actions
-- Evaluation uses only the individual Q-tables (decentralized policy)
+#### `qmix_credit_assignment` parameters
 
-**Algorithm outline:**
-1. Each agent selects actions using its own Q-table (ε-greedy)
-2. Individual Q-values are updated using standard Q-learning
-3. Mixing network combines individual Q-values into a global estimate
-4. Mixing network weights are updated using the global TD error
-5. This encourages agents to learn policies that work well when mixed together
+| Field | Default | Description |
+|---|---:|---|
+| `enabled` | `true` | Master switch for mixed-TD Q-table feedback. If set to `false`, the code forces `qtable_update_mode` to `"local_only"`. This does **not** automatically disable mixer training; set `update_mixer` to `false` as well if you want an IQL-like run with no useful mixer. |
+| `qtable_update_mode` | `"hybrid"` | Selects how Q-table entries are updated. Supported values are `"local_only"`, `"equal_share"`, `"mixer_weight_share"`, `"full_shared_td"`, and `"hybrid"`. |
+| `mixed_td_strategy` | `"equal_share"` | Selects the mixed-TD credit strategy used by `"hybrid"`. Supported values are `"equal_share"`, `"mixer_weight_share"`, and `"full_shared_td"`. Ignored by non-hybrid modes. |
+| `local_td_weight` | `1.0` | Multiplier for the local independent-Q-learning TD update. Meaningful only for `"local_only"` and `"hybrid"`. |
+| `mixed_td_weight` | `1.0` | Multiplier for the mixed-TD Q-table feedback update. Meaningful for `"equal_share"`, `"mixer_weight_share"`, `"full_shared_td"`, and `"hybrid"`. |
+| `update_mixer` | `true` | Whether to train the same-mode mixer weights using the same-mode mixed TD error. Usually should be `true` whenever mixed TD feedback is used. |
+| `weight_epsilon` | `1e-12` | Numerical threshold used by `"mixer_weight_share"`. If the relevant mixer weights are too close to zero, the implementation falls back to equal sharing. Ignored by other strategies. |
+
+#### Q-table update modes
+
+##### `local_only`
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "local_only",
+    "local_td_weight": 1.0,
+    "update_mixer": true
+}
+```
+
+Each agent updates its own Q-table using only its own local TD error:
+
+```text
+Q_i += alpha * local_td_weight * local_td_error
+```
+
+The mixer may still be trained if `update_mixer` is `true`, but the mixer TD error is not written back into the Q-tables. Therefore, in this mode the mixer is auxiliary and does not affect the decentralized policies.
+
+Use this mode as an independent-Q-learning-style baseline or ablation inside the tabular QMIX code path.
+
+To remove the practical effect of the mixer, use:
+
+```json
+"qmix_credit_assignment": {
+    "enabled": false,
+    "qtable_update_mode": "local_only",
+    "local_td_weight": 1.0,
+    "update_mixer": false
+}
+```
+
+##### `equal_share`
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "equal_share",
+    "mixed_td_weight": 1.0,
+    "update_mixer": true
+}
+```
+
+This mode skips the local TD update and updates each same-mode agent's Q-table with an equal fraction of the same-mode mixed TD error:
+
+```text
+credit_share_i = 1 / same_mode_group_size
+
+Q_i += alpha * mixed_td_weight * credit_share_i * mode_td_error
+```
+
+This is the simplest cooperative credit-assignment rule. It is most appropriate when same-mode agents are homogeneous and symmetric, or when there is no reliable reason to assign more credit to one same-mode agent than another.
+
+It may be too crude when agents have different roles, observations, or contributions, because every same-mode agent receives the same share of the group error.
+
+##### `mixer_weight_share`
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "mixer_weight_share",
+    "mixed_td_weight": 1.0,
+    "update_mixer": true,
+    "weight_epsilon": 1e-12
+}
+```
+
+This mode skips the local TD update and distributes the same-mode mixed TD error according to the current same-mode mixer weights:
+
+```text
+credit_share_i proportional to abs(mixer_weight_i)
+```
+
+The absolute value is used so that negative weights in the simple linear mixer do not invert the sign of the TD correction. Shares are normalized to sum to one. If the relevant mixer weights are all near zero, the implementation falls back to equal sharing.
+
+This mode is meaningful when the mixer weights have become informative and can be interpreted as a rough estimate of each same-mode agent's contribution to the mixed value.
+
+It can be fragile early in training because the mixer weights are initially random and may not yet represent useful credit assignment. For that reason, this strategy is often safer inside `"hybrid"` than as a pure update mode.
+
+##### `full_shared_td`
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "full_shared_td",
+    "mixed_td_weight": 0.1,
+    "update_mixer": true
+}
+```
+
+This mode skips the local TD update and applies the full same-mode mixed TD error to every same-mode agent:
+
+```text
+credit_share_i = 1
+
+Q_i += alpha * mixed_td_weight * mode_td_error
+```
+
+This is the strongest cooperative update. Every same-mode agent receives the full group-level correction.
+
+It can be useful when you want to aggressively align same-mode agents around the same collective signal. However, it can easily over-amplify the update, because the total Q-table change scales with the number of same-mode agents. For that reason, `mixed_td_weight` should usually be smaller for this mode than for `"equal_share"` or `"mixer_weight_share"`.
+
+##### `hybrid`
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "hybrid",
+    "mixed_td_strategy": "equal_share",
+    "local_td_weight": 1.0,
+    "mixed_td_weight": 1.0,
+    "update_mixer": true
+}
+```
+
+This is the recommended default.
+
+In hybrid mode, each same-mode agent receives both:
+
+1. a local independent-Q-learning TD update;
+2. a same-mode mixed TD update.
+
+```text
+Q_i += alpha * local_td_weight * local_td_error
+Q_i += alpha * mixed_td_weight * credit_share_i * mode_td_error
+```
+
+The `mixed_td_strategy` field chooses how the mixed TD error is shared:
+
+```json
+"mixed_td_strategy": "equal_share"
+```
+
+or:
+
+```json
+"mixed_td_strategy": "mixer_weight_share"
+```
+
+or:
+
+```json
+"mixed_td_strategy": "full_shared_td"
+```
+
+Hybrid mode is usually the safest choice because the local reward signal remains available while the same-mode mixer adds a cooperative training signal.
+
+#### Meaningful configuration combinations
+
+##### Recommended default: local learning plus equal cooperative signal
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "hybrid",
+    "mixed_td_strategy": "equal_share",
+    "local_td_weight": 1.0,
+    "mixed_td_weight": 1.0,
+    "update_mixer": true
+}
+```
+
+Use this as the default starting point. Agents learn from their own rewards and also receive a normalized same-mode cooperative TD signal.
+
+##### Conservative hybrid: mostly local, weak cooperative correction
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "hybrid",
+    "mixed_td_strategy": "equal_share",
+    "local_td_weight": 1.0,
+    "mixed_td_weight": 0.1,
+    "update_mixer": true
+}
+```
+
+Use this when mixed TD feedback is noisy or destabilizes training. The local Q-learning signal dominates, while the mixer provides a weaker same-mode correction.
+
+##### Weight-based hybrid
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "hybrid",
+    "mixed_td_strategy": "mixer_weight_share",
+    "local_td_weight": 1.0,
+    "mixed_td_weight": 1.0,
+    "update_mixer": true,
+    "weight_epsilon": 1e-12
+}
+```
+
+This keeps the local TD update and lets the mixer decide how much of the mixed TD error each same-mode agent receives.
+
+This is more adaptive than equal sharing, but it relies on the mixer weights being meaningful. If training is unstable, prefer `"equal_share"` first.
+
+##### Strong cooperative hybrid
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "hybrid",
+    "mixed_td_strategy": "full_shared_td",
+    "local_td_weight": 1.0,
+    "mixed_td_weight": 0.1,
+    "update_mixer": true
+}
+```
+
+Every same-mode agent receives the full same-mode mixed TD error in addition to the local TD update. This is a strong coupling configuration and should usually use a smaller `mixed_td_weight`.
+
+##### Pure cooperative equal-share update
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "equal_share",
+    "mixed_td_weight": 1.0,
+    "update_mixer": true
+}
+```
+
+This removes the local TD update and trains Q-tables only through the same-mode mixed TD error with equal sharing.
+
+Use this to test whether same-mode cooperative learning alone is sufficient.
+
+##### Pure cooperative mixer-weight update
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "mixer_weight_share",
+    "mixed_td_weight": 1.0,
+    "update_mixer": true,
+    "weight_epsilon": 1e-12
+}
+```
+
+This trains Q-tables only through the same-mode mixed TD error, distributed according to mixer weights.
+
+This is meaningful as an experiment, but it is more fragile than hybrid mode because early mixer weights may not provide reliable credit assignments.
+
+##### Pure cooperative full-shared update
+
+```json
+"qmix_credit_assignment": {
+    "enabled": true,
+    "qtable_update_mode": "full_shared_td",
+    "mixed_td_weight": 0.1,
+    "update_mixer": true
+}
+```
+
+This trains Q-tables only through the full same-mode mixed TD error.
+
+Because every same-mode agent receives the full error, this can produce large updates. Prefer a smaller `mixed_td_weight`.
+
+#### Difference from CoQL
+
+CoQL shares information explicitly between same-mode peers. For example, it may blend observations, actions, rewards, or Q-values from selected same-mode agents into the recipient's Q-table.
+
+Tabular QMIX shares information differently. It does not copy peer Q-values directly. Instead, it computes a same-mode group TD error through a same-mode mixer and then assigns that group-level TD error back into the same-mode agents' Q-table entries.
+
+```text
+CoQL:
+    same-mode peer data
+        -> direct Q-table collaboration
+
+Tabular QMIX:
+    same-mode rewards + same-mode Q-values
+        -> same-mode mixed TD error
+        -> configurable Q-table credit assignment
+```
+
+#### Difference from QMIXLearningNN
+
+The `qmix_credit_assignment` block is only for tabular QMIX.
+
+Neural-network QMIX does not use this block because PyTorch backpropagation already propagates the mixed TD loss through the mixer into the agent networks.
+
+Use:
+
+```text
+agents/QMIXLearning/config/learning-params.json
+    -> use mixing_learning_rate
+    -> use qmix_credit_assignment
+
+agents/QMIXLearningNN/config/learning-params.json
+    -> use mixer_learning_rate
+    -> do not use qmix_credit_assignment
+```
 
 ---
 
