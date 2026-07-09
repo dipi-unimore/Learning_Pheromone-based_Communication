@@ -14,7 +14,6 @@ For this tabular environment implementation:
     - Training minimizes TD error on the mixed Q-value
 """
 
-import collections
 import itertools
 import random
 from typing import Dict, List, Tuple
@@ -22,6 +21,9 @@ from typing import Dict, List, Tuple
 import numpy as np
 from numpy.typing import NDArray
 from tqdm import tqdm
+
+
+_MODES = ("c", "s")
 
 
 class MixingNetwork:
@@ -37,14 +39,31 @@ class MixingNetwork:
     """
 
     def __init__(self, n_agents: int, n_actions: int, learning_rate: float = 0.025):
-        self.n_agents = n_agents
-        self.n_actions = n_actions
+        if int(n_agents) <= 0:
+            raise ValueError("MixingNetwork requires at least one agent")
+        self.n_agents = int(n_agents)
+        self.n_actions = int(n_actions)
         self.learning_rate = learning_rate
 
         # Mixing weights: one set per action (agents x 1)
-        self.weights = np.random.randn(n_actions, n_agents) * 0.01
+        self.weights = np.random.randn(self.n_actions, self.n_agents) * 0.01
         # Value baseline
-        self.value = np.zeros(n_actions)
+        self.value = np.zeros(self.n_actions)
+
+    def _q_array(self, individual_q_values: List[float]) -> NDArray:
+        q_array = np.asarray(individual_q_values, dtype=float).reshape(-1)
+        if q_array.shape[0] != self.n_agents:
+            raise ValueError(
+                f"MixingNetwork expected {self.n_agents} individual Q-values, "
+                f"got {q_array.shape[0]}"
+            )
+        return q_array
+
+    def _validate_action(self, action_idx: int) -> int:
+        action_idx = int(action_idx)
+        if action_idx < 0 or action_idx >= self.n_actions:
+            raise ValueError(f"action_idx {action_idx} is outside [0, {self.n_actions})")
+        return action_idx
 
     def forward(self, individual_q_values: List[float], action_idx: int) -> float:
         """
@@ -57,7 +76,8 @@ class MixingNetwork:
         Returns:
             Mixed Q-value
         """
-        q_array = np.array(individual_q_values)
+        action_idx = self._validate_action(action_idx)
+        q_array = self._q_array(individual_q_values)
         mixed = np.dot(self.weights[action_idx], q_array) + self.value[action_idx]
         return float(mixed)
 
@@ -75,7 +95,8 @@ class MixingNetwork:
             action_idx: Action index
             td_error: Temporal difference error
         """
-        q_array = np.array(individual_q_values)
+        action_idx = self._validate_action(action_idx)
+        q_array = self._q_array(individual_q_values)
 
         # Gradient w.r.t. weights: td_error * q_array
         grad_w = td_error * q_array
@@ -84,6 +105,145 @@ class MixingNetwork:
         # Gradient w.r.t. value: td_error
         grad_v = td_error
         self.value[action_idx] -= self.learning_rate * grad_v
+
+
+def _agent_ids_by_mode_from_params(params: Dict) -> Dict[str, List[int]]:
+    """
+    Return the fixed Slime learner id partition by kind/mode.
+
+    Slime creates cluster learners first and scatter learners afterwards. Keeping
+    separate mixer groups for these ids prevents QMIX centralized training from
+    using the other kind's rewards, actions, or Q-values as shared learning data.
+    """
+
+    cluster_count = int(params["cluster_learners"])
+    scatter_count = int(params["scatter_learners"])
+    groups = {
+        "c": list(range(cluster_count)),
+        "s": list(range(cluster_count, cluster_count + scatter_count)),
+    }
+    return {mode: ids for mode, ids in groups.items() if ids}
+
+
+def _agent_ids_by_mode_from_env(env, agents_num: int) -> Dict[str, List[int]]:
+    """
+    Return learner ids grouped by env.learners[*]["mode"].
+    """
+
+    groups = {mode: [] for mode in _MODES}
+    for agent_id in range(agents_num):
+        mode = env.learners[agent_id]["mode"]
+        if mode not in groups:
+            raise ValueError(f"Unsupported learner mode for agent {agent_id}: {mode!r}")
+        groups[mode].append(agent_id)
+    return {mode: ids for mode, ids in groups.items() if ids}
+
+
+def _build_mixing_networks(params: Dict, n_actions: int, learning_rate: float) -> Dict[str, MixingNetwork]:
+    """
+    Build one independent mixer per non-empty learner kind.
+    """
+
+    return {
+        mode: MixingNetwork(n_agents=len(agent_ids), n_actions=n_actions, learning_rate=learning_rate)
+        for mode, agent_ids in _agent_ids_by_mode_from_params(params).items()
+    }
+
+
+def _ensure_mode_mixing_networks(
+    mixing_net,
+    agent_ids_by_mode: Dict[str, List[int]],
+) -> Dict[str, MixingNetwork]:
+    """
+    Validate that training uses independent same-mode mixers.
+
+    A legacy single all-agent mixer is rejected when both modes are present,
+    because it is a cross-mode information channel.
+    """
+
+    if isinstance(mixing_net, MixingNetwork):
+        if len(agent_ids_by_mode) == 1:
+            mode, agent_ids = next(iter(agent_ids_by_mode.items()))
+            if mixing_net.n_agents != len(agent_ids):
+                raise ValueError(
+                    f"Legacy single mixer has {mixing_net.n_agents} agents, "
+                    f"but mode {mode!r} has {len(agent_ids)} agents"
+                )
+            return {mode: mixing_net}
+        raise ValueError(
+            "QMIX same-mode constraint requires a dict of independent mixers "
+            "when both cluster ('c') and scatter ('s') learners are present"
+        )
+
+    if not isinstance(mixing_net, dict):
+        raise TypeError("mixing_net must be a dict mapping learner mode to MixingNetwork")
+
+    validated: Dict[str, MixingNetwork] = {}
+    for mode, agent_ids in agent_ids_by_mode.items():
+        if mode not in mixing_net:
+            raise ValueError(f"Missing MixingNetwork for learner mode {mode!r}")
+        net = mixing_net[mode]
+        if not isinstance(net, MixingNetwork):
+            raise TypeError(f"Mixer for learner mode {mode!r} is not a MixingNetwork")
+        if net.n_agents != len(agent_ids):
+            raise ValueError(
+                f"Mixer for mode {mode!r} has {net.n_agents} agents, "
+                f"but the environment has {len(agent_ids)} agents of that mode"
+            )
+        validated[mode] = net
+
+    extra_modes = set(mixing_net) - set(agent_ids_by_mode)
+    if extra_modes:
+        raise ValueError(f"Mixing networks provided for inactive modes: {sorted(extra_modes)}")
+
+    return validated
+
+
+def _update_mode_mixing_networks(
+    qtable: NDArray,
+    mixing_nets: Dict[str, MixingNetwork],
+    step_info: Dict[int, Dict],
+    old_s: Dict[str, int],
+    old_a: Dict[str, int],
+    agent_ids_by_mode: Dict[str, List[int]],
+    n_actions: int,
+    gamma: float,
+) -> None:
+    """
+    Update each mode-specific mixer using only same-mode agent data.
+    """
+
+    for mode, agent_ids in agent_ids_by_mode.items():
+        mode_step_ids = [agent_id for agent_id in agent_ids if agent_id in step_info]
+        if not mode_step_ids:
+            continue
+        if len(mode_step_ids) != len(agent_ids):
+            continue
+
+        if any(str(agent_id) not in old_s or str(agent_id) not in old_a for agent_id in mode_step_ids):
+            continue
+
+        mode_mixer = mixing_nets[mode]
+        individual_q_values = [
+            float(qtable[agent_id, old_s[str(agent_id)], old_a[str(agent_id)]])
+            for agent_id in mode_step_ids
+        ]
+        next_individual_q_values = [
+            float(np.max(qtable[agent_id, step_info[agent_id]["state"], :]))
+            for agent_id in mode_step_ids
+        ]
+        reward_sum = sum(float(step_info[agent_id]["reward"]) for agent_id in mode_step_ids)
+
+        for agent_id in mode_step_ids:
+            old_a_int = int(old_a[str(agent_id)])
+            mixed_q = mode_mixer.forward(individual_q_values, old_a_int)
+            mixed_q_next = max(
+                mode_mixer.forward(next_individual_q_values, action_idx)
+                for action_idx in range(n_actions)
+            )
+            mixed_target = reward_sum + gamma * mixed_q_next
+            td_error = mixed_target - mixed_q
+            mode_mixer.backward(individual_q_values, old_a_int, td_error)
 
 
 def create_agent(
@@ -115,12 +275,11 @@ def create_agent(
     # Initialize per-agent Q-tables (same structure as IQL)
     qtable = np.zeros([learner_population, n_obs, n_actions])
 
-    # Initialize mixing network for aggregating individual Q-values
-    mixing_net = MixingNetwork(
-        n_agents=learner_population,
-        n_actions=n_actions,
-        learning_rate=l_params.get("mixing_learning_rate", l_params.get("alpha", 0.025)),
-    )
+    # Initialize one independent mixer per learner kind. This enforces the
+    # constraint that cluster learners share centralized-training information
+    # only with cluster learners, and scatter learners only with scatter learners.
+    mixing_learning_rate = l_params.get("mixing_learning_rate", l_params.get("alpha", 0.025))
+    mixing_net = _build_mixing_networks(params, n_actions, mixing_learning_rate)
 
     # Action frequency tracking per episode
     cluster_actions_dict = {
@@ -211,7 +370,7 @@ def train(
     params: Dict,
     l_params: Dict,
     qtable: NDArray,
-    mixing_net: MixingNetwork,
+    mixing_net: Dict[str, MixingNetwork],
     cluster_dict: Dict,
     cluster_actions_dict: Dict,
     cluster_action_dict: Dict,
@@ -230,7 +389,7 @@ def train(
     print_metrics: int,
     logger,
     visualizer=None,
-) -> Tuple[NDArray, MixingNetwork]:
+) -> Tuple[NDArray, Dict[str, MixingNetwork]]:
     """
     Train QMIX agent(s) on the environment.
 
@@ -242,7 +401,7 @@ def train(
         params: Environment configuration
         l_params: Learning parameters
         qtable: Per-agent Q-tables [n_agents, n_obs, n_actions]
-        mixing_net: Mixing network for value decomposition
+        mixing_net: Mode-specific mixing networks for value decomposition
         cluster_dict: Cumulative metrics tracking
         cluster_actions_dict: Action frequency per episode
         cluster_action_dict: Per-agent action frequency per episode
@@ -271,6 +430,8 @@ def train(
     old_a = {}
     previous_actions = {}
     agents_num = env.cluster_learners + env.scatter_learners
+    agent_ids_by_mode = _agent_ids_by_mode_from_env(env, agents_num)
+    mixing_net = _ensure_mode_mixing_networks(mixing_net, agent_ids_by_mode)
 
     # Tracking dicts for mixed vs individual Q-values
     only_cluster_dict = {str(ep): 0.0 for ep in range(1, train_episodes + 1)}
@@ -334,40 +495,20 @@ def train(
                     scatter_action_dict[str(ep)][str(agent)][str(action)] += 1
                     scatter_reward_dict[str(ep)][str(agent)] += round(reward, 2)
 
-            # QMIX value decomposition update: use mixing network to combine individual Q-values
-            # This happens after all agents have acted, allowing centralized training
+            # QMIX value decomposition update: use one mixer per learner kind.
+            # This happens after all agents have acted, allowing centralized
+            # training without cross-mode information sharing.
             if tick > 1:  # Skip first tick (no old values to mix yet)
-                for agent_id in sorted(step_info.keys()):
-                    if agent_id not in old_s or agent_id not in old_a:
-                        continue
-
-                    # Collect individual Q-values for all agents at the old state
-                    individual_q_values = [
-                        float(qtable[ag_id, old_s.get(str(ag_id), 0), old_a.get(str(ag_id), 0)])
-                        for ag_id in range(agents_num)
-                    ]
-
-                    # Compute mixed Q-value at old state/action
-                    old_a_int = int(old_a[str(agent_id)])
-                    mixed_q = mixing_net.forward(individual_q_values, old_a_int)
-
-                    # Compute target: max over actions for all agents (for next-state mixed value)
-                    next_individual_q_values = [
-                        float(np.max(qtable[ag_id, step_info.get(ag_id, {}).get("state", 0), :]))
-                        for ag_id in range(agents_num)
-                    ]
-                    mixed_q_next = max(
-                        mixing_net.forward(next_individual_q_values, a)
-                        for a in range(n_actions)
-                    )
-
-                    # TD error on mixed Q-value
-                    reward_sum = sum(step_info.get(ag_id, {}).get("reward", 0.0) for ag_id in range(agents_num))
-                    mixed_target = reward_sum + gamma * mixed_q_next
-                    td_error = mixed_target - mixed_q
-
-                    # Update mixing network with TD error
-                    mixing_net.backward(individual_q_values, old_a_int, td_error)
+                _update_mode_mixing_networks(
+                    qtable=qtable,
+                    mixing_nets=mixing_net,
+                    step_info=step_info,
+                    old_s=old_s,
+                    old_a=old_a,
+                    agent_ids_by_mode=agent_ids_by_mode,
+                    n_actions=n_actions,
+                    gamma=gamma,
+                )
 
             # Environment metrics per tick
             if env.cluster_learners == 0 or env.scatter_learners == 0:
@@ -610,4 +751,3 @@ def eval(
     if visualizer is not None:
         visualizer.close()
     print("Evaluation finished (QMIX)!\n")
-
