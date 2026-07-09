@@ -4,7 +4,7 @@ QMIX with Neural Networks — Alternative C (Replay Buffer + Mini-batch + Target
 This module keeps the existing runner-facing API but changes training to an
 off-policy deep-RL workflow:
 
-1) Collect joint transitions into a replay buffer
+1) Collect same-mode joint transitions into per-mode replay buffers
 2) Sample mini-batches
 3) Compute QMIX TD loss with target networks
 4) Update online networks
@@ -45,6 +45,35 @@ def _one_hot(index: int, size: int) -> NDArray:
     v = np.zeros(size, dtype=np.float32)
     v[int(index)] = 1.0
     return v
+
+
+# Slime uses "c" for clustering learners and "s" for scattering learners.
+# Keeping this order stable also makes packed .npy model files deterministic.
+_MODE_ORDER = ("c", "s")
+_MODE_CODES = {"c": 0, "s": 1}
+_CODE_TO_MODE = {code: mode for mode, code in _MODE_CODES.items()}
+
+
+def _agent_ids_by_mode_from_counts(cluster_learners: int, scatter_learners: int) -> Dict[str, List[int]]:
+    """Return contiguous Slime agent ids grouped by learner mode."""
+
+    cluster_count = int(cluster_learners)
+    scatter_count = int(scatter_learners)
+    groups = {
+        "c": list(range(cluster_count)),
+        "s": list(range(cluster_count, cluster_count + scatter_count)),
+    }
+    return {mode: ids for mode, ids in groups.items() if ids}
+
+
+def _agent_ids_by_mode_from_env(env) -> Dict[str, List[int]]:
+    """Return actual env learner ids grouped by mode."""
+
+    groups = {mode: [] for mode in _MODE_ORDER}
+    for agent_id, learner in sorted(env.learners.items()):
+        mode = learner["mode"]
+        groups.setdefault(mode, []).append(int(agent_id))
+    return {mode: ids for mode, ids in groups.items() if ids}
 
 
 # ---------------------------------------------------------------------------
@@ -168,50 +197,149 @@ class QMIXMixer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Serialization
+# Mode-specific mixer helpers and serialization
 # ---------------------------------------------------------------------------
 
 
-def save_model(agent_nets: List[AgentQNetwork], mixer: QMIXMixer, path: str) -> None:
-    torch.save(
-        {
-            "agent_nets": [net.state_dict() for net in agent_nets],
-            "mixer": mixer.state_dict(),
-        },
-        path,
-    )
+def _create_mode_mixers(
+    agent_ids_by_mode: Dict[str, List[int]],
+    n_obs: int,
+    hidden_dim: int,
+    learning_rate: float,
+    device: torch.device,
+) -> Dict[str, QMIXMixer]:
+    """Create one independent mixer per non-empty learner mode."""
+
+    return {
+        mode: QMIXMixer(
+            n_agents=len(agent_ids),
+            state_dim=len(agent_ids) * n_obs,
+            hidden_dim=hidden_dim,
+            learning_rate=learning_rate,
+            device=device,
+        )
+        for mode, agent_ids in agent_ids_by_mode.items()
+    }
 
 
-def load_model(agent_nets: List[AgentQNetwork], mixer: QMIXMixer, path: str, device: torch.device) -> None:
+def _ordered_mixer_items(mixer) -> List[Tuple[str, QMIXMixer]]:
+    if not isinstance(mixer, dict):
+        return [("", mixer)]
+
+    known_items = [(mode, mixer[mode]) for mode in _MODE_ORDER if mode in mixer]
+    extra_items = [(mode, mixer[mode]) for mode in sorted(mixer.keys()) if mode not in _MODE_ORDER]
+    return known_items + extra_items
+
+
+def _assert_mode_mixers(mixer, agent_ids_by_mode: Dict[str, List[int]], n_obs: int) -> None:
+    """Fail fast if the supplied mixers cannot keep modes isolated."""
+
+    if not isinstance(mixer, dict):
+        raise ValueError("[ERROR] QMIX-NN requires one mixer per learner mode to avoid cross-mode sharing")
+
+    if set(mixer.keys()) != set(agent_ids_by_mode.keys()):
+        raise ValueError(
+            "[ERROR] QMIX-NN mixer modes do not match active learner modes: "
+            f"mixers={sorted(mixer.keys())}, learners={sorted(agent_ids_by_mode.keys())}"
+        )
+
+    for mode, agent_ids in agent_ids_by_mode.items():
+        expected_n_agents = len(agent_ids)
+        expected_state_dim = expected_n_agents * n_obs
+        if mixer[mode].n_agents != expected_n_agents:
+            raise ValueError(
+                f"[ERROR] mixer for mode {mode!r} has n_agents={mixer[mode].n_agents}, "
+                f"expected {expected_n_agents}"
+            )
+        if mixer[mode].state_dim != expected_state_dim:
+            raise ValueError(
+                f"[ERROR] mixer for mode {mode!r} has state_dim={mixer[mode].state_dim}, "
+                f"expected {expected_state_dim}"
+            )
+
+
+def _module_param_vector(module: nn.Module) -> np.ndarray:
+    return torch.cat([p.detach().cpu().view(-1) for p in module.parameters()]).numpy().astype(np.float32)
+
+
+def _copy_param_vector_to_module(param_vec: NDArray, module: nn.Module, device: torch.device) -> None:
+    expected = sum(p.numel() for p in module.parameters())
+    if int(param_vec.size) != expected:
+        raise ValueError(f"packed parameter count {int(param_vec.size)} does not match module count {expected}")
+
+    idx = 0
+    for p in module.parameters():
+        n = p.numel()
+        chunk = torch.from_numpy(param_vec[idx : idx + n]).to(device=device, dtype=p.dtype).view_as(p)
+        with torch.no_grad():
+            p.copy_(chunk)
+        idx += n
+
+
+def save_model(agent_nets: List[AgentQNetwork], mixer, path: str) -> None:
+    checkpoint = {"agent_nets": [net.state_dict() for net in agent_nets]}
+    if isinstance(mixer, dict):
+        checkpoint["mixers"] = {mode: mode_mixer.state_dict() for mode, mode_mixer in _ordered_mixer_items(mixer)}
+    else:
+        checkpoint["mixer"] = mixer.state_dict()
+    torch.save(checkpoint, path)
+
+
+def load_model(agent_nets: List[AgentQNetwork], mixer, path: str, device: torch.device) -> None:
     checkpoint = torch.load(path, map_location=device)
     for i, state_dict in enumerate(checkpoint["agent_nets"]):
         agent_nets[i].load_state_dict(state_dict)
-    mixer.load_state_dict(checkpoint["mixer"])
+
+    if isinstance(mixer, dict):
+        if "mixers" not in checkpoint:
+            raise ValueError("checkpoint contains a legacy single mixer, but this run expects mode-specific mixers")
+        missing = set(mixer.keys()) - set(checkpoint["mixers"].keys())
+        if missing:
+            raise ValueError(f"checkpoint is missing mixer(s) for mode(s): {sorted(missing)}")
+        for mode, mode_mixer in _ordered_mixer_items(mixer):
+            mode_mixer.load_state_dict(checkpoint["mixers"][mode])
+    else:
+        mixer.load_state_dict(checkpoint["mixer"])
 
 
-def pack_model(agent_nets: List[AgentQNetwork], mixer: QMIXMixer) -> NDArray:
+def pack_model(agent_nets: List[AgentQNetwork], mixer) -> NDArray:
     """
     Pack all NN parameters into a flat float32 numpy vector.
 
-    This keeps compatibility with the existing Logger .npy save/load flow.
+    Mode-specific mixer packs start with a negative mixer-count marker after
+    the agent-network blocks, followed by (mode_code, parameter_count, params)
+    for each mixer. Legacy single-mixer packs remain supported for callers that
+    still pass a single QMIXMixer.
     """
+
     flat_parts: List[np.ndarray] = []
     for net in agent_nets:
-        params = torch.cat([p.detach().cpu().view(-1) for p in net.parameters()]).numpy().astype(np.float32)
+        params = _module_param_vector(net)
         flat_parts.append(np.asarray([float(params.size)], dtype=np.float32))
         flat_parts.append(params)
 
-    mixer_params = torch.cat([p.detach().cpu().view(-1) for p in mixer.parameters()]).numpy().astype(np.float32)
-    flat_parts.append(np.asarray([float(mixer_params.size)], dtype=np.float32))
-    flat_parts.append(mixer_params)
+    if isinstance(mixer, dict):
+        mixer_items = _ordered_mixer_items(mixer)
+        flat_parts.append(np.asarray([-float(len(mixer_items))], dtype=np.float32))
+        for mode, mode_mixer in mixer_items:
+            if mode not in _MODE_CODES:
+                raise ValueError(f"cannot pack unknown mixer mode: {mode!r}")
+            params = _module_param_vector(mode_mixer)
+            flat_parts.append(np.asarray([float(_MODE_CODES[mode]), float(params.size)], dtype=np.float32))
+            flat_parts.append(params)
+    else:
+        mixer_params = _module_param_vector(mixer)
+        flat_parts.append(np.asarray([float(mixer_params.size)], dtype=np.float32))
+        flat_parts.append(mixer_params)
 
     return np.concatenate(flat_parts).astype(np.float32)
 
 
-def unpack_model(flat_weights: NDArray, agent_nets: List[AgentQNetwork], mixer: QMIXMixer) -> None:
+def unpack_model(flat_weights: NDArray, agent_nets: List[AgentQNetwork], mixer) -> None:
     """
     Restore model parameters from a flat vector produced by pack_model().
     """
+
     vec = np.asarray(flat_weights, dtype=np.float32).ravel()
     offset = 0
 
@@ -220,24 +348,39 @@ def unpack_model(flat_weights: NDArray, agent_nets: List[AgentQNetwork], mixer: 
         offset += 1
         net_vec = vec[offset : offset + count]
         offset += count
-        idx = 0
-        for p in net.parameters():
-            n = p.numel()
-            chunk = torch.from_numpy(net_vec[idx : idx + n]).to(device=net.device, dtype=p.dtype).view_as(p)
-            with torch.no_grad():
-                p.copy_(chunk)
-            idx += n
+        _copy_param_vector_to_module(net_vec, net, net.device)
 
-    mixer_count = int(vec[offset])
+    marker = int(vec[offset])
     offset += 1
-    mixer_vec = vec[offset : offset + mixer_count]
-    idx = 0
-    for p in mixer.parameters():
-        n = p.numel()
-        chunk = torch.from_numpy(mixer_vec[idx : idx + n]).to(device=mixer.device, dtype=p.dtype).view_as(p)
-        with torch.no_grad():
-            p.copy_(chunk)
-        idx += n
+
+    if isinstance(mixer, dict):
+        if marker >= 0:
+            raise ValueError("packed model uses a legacy single mixer, but this run expects mode-specific mixers")
+
+        expected_mixers = -marker
+        loaded_modes = set()
+        for _ in range(expected_mixers):
+            mode_code = int(vec[offset])
+            mixer_count = int(vec[offset + 1])
+            offset += 2
+            mode = _CODE_TO_MODE.get(mode_code)
+            if mode is None:
+                raise ValueError(f"packed model contains unknown mixer mode code: {mode_code}")
+            if mode not in mixer:
+                raise ValueError(f"packed model contains unexpected mixer mode: {mode!r}")
+            mixer_vec = vec[offset : offset + mixer_count]
+            offset += mixer_count
+            _copy_param_vector_to_module(mixer_vec, mixer[mode], mixer[mode].device)
+            loaded_modes.add(mode)
+
+        missing = set(mixer.keys()) - loaded_modes
+        if missing:
+            raise ValueError(f"packed model is missing mixer(s) for mode(s): {sorted(missing)}")
+    else:
+        if marker < 0:
+            raise ValueError("packed model uses mode-specific mixers, but this run supplied a single mixer")
+        mixer_vec = vec[offset : offset + marker]
+        _copy_param_vector_to_module(mixer_vec, mixer, mixer.device)
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +492,8 @@ def create_agent(params: Dict, l_params: Dict, n_obs: int, n_actions: int, train
     decay = float(l_params.get("decay", 0.9987))
 
     agent_nets = [AgentQNetwork(n_obs, hidden_dim, n_actions, agent_lr, device) for _ in range(n_agents)]
-    mixer = QMIXMixer(n_agents=n_agents, state_dim=n_agents * n_obs, hidden_dim=mixer_hidden_dim, learning_rate=mixer_lr, device=device)
+    agent_ids_by_mode = _agent_ids_by_mode_from_counts(params["cluster_learners"], params["scatter_learners"])
+    mixer = _create_mode_mixers(agent_ids_by_mode, n_obs, mixer_hidden_dim, mixer_lr, device)
 
     (
         cluster_dict,
@@ -401,7 +545,7 @@ def create_agent(params: Dict, l_params: Dict, n_obs: int, n_actions: int, train
 def _sample_and_update(
     replay: ReplayBuffer,
     batch_size: int,
-    n_agents: int,
+    agent_ids: List[int],
     n_obs: int,
     gamma: float,
     device: torch.device,
@@ -410,10 +554,13 @@ def _sample_and_update(
     target_agent_nets: List[AgentQNetwork],
     target_mixer: QMIXMixer,
 ) -> None:
-    batch = replay.sample(batch_size)
+    """Sample and update one same-mode QMIX team only."""
 
-    states = np.stack([tr.global_state for tr in batch]).astype(np.float32)          # [B, state_dim]
-    actions = np.stack([tr.actions for tr in batch]).astype(np.int64)                # [B, n_agents]
+    batch = replay.sample(batch_size)
+    n_mode_agents = len(agent_ids)
+
+    states = np.stack([tr.global_state for tr in batch]).astype(np.float32)          # [B, mode_state_dim]
+    actions = np.stack([tr.actions for tr in batch]).astype(np.int64)                # [B, n_mode_agents]
     rewards = np.asarray([tr.team_reward for tr in batch], dtype=np.float32)         # [B]
     next_states = np.stack([tr.next_global_state for tr in batch]).astype(np.float32)
     dones = np.asarray([tr.done for tr in batch], dtype=np.float32)
@@ -424,26 +571,26 @@ def _sample_and_update(
     next_states_t = torch.as_tensor(next_states, dtype=torch.float32, device=device)
     dones_t = torch.as_tensor(dones, dtype=torch.float32, device=device)
 
-    # Split global state into per-agent observation slices
-    # obs slice for agent i is [i*n_obs : (i+1)*n_obs]
+    # Split same-mode state into per-agent observation slices. The local slice
+    # index is independent from the global Slime agent id.
     online_selected_qs = []
     target_next_max_qs = []
 
-    for i in range(n_agents):
-        obs_i = states_t[:, i * n_obs : (i + 1) * n_obs]                 # [B, n_obs]
-        next_obs_i = next_states_t[:, i * n_obs : (i + 1) * n_obs]       # [B, n_obs]
+    for local_i, agent_id in enumerate(agent_ids):
+        obs_i = states_t[:, local_i * n_obs : (local_i + 1) * n_obs]                 # [B, n_obs]
+        next_obs_i = next_states_t[:, local_i * n_obs : (local_i + 1) * n_obs]       # [B, n_obs]
 
-        q_i = agent_nets[i](obs_i)                                        # [B, n_actions]
-        q_i_selected = q_i.gather(1, actions_t[:, i].unsqueeze(1)).squeeze(1)  # [B]
+        q_i = agent_nets[agent_id](obs_i)                                            # [B, n_actions]
+        q_i_selected = q_i.gather(1, actions_t[:, local_i].unsqueeze(1)).squeeze(1)   # [B]
         online_selected_qs.append(q_i_selected)
 
-        # Double-Q target:
-        # action from online net, value from target net
-        q_next_i_double = _double_q_next_values(agent_nets[i], target_agent_nets[i], next_obs_i)
+        # Double-Q target: action from online net, value from target net.
+        q_next_i_double = _double_q_next_values(agent_nets[agent_id], target_agent_nets[agent_id], next_obs_i)
         target_next_max_qs.append(q_next_i_double)
 
-    online_selected_qs_t = torch.stack(online_selected_qs, dim=1)         # [B, n_agents]
-    target_next_max_qs_t = torch.stack(target_next_max_qs, dim=1)         # [B, n_agents]
+    online_selected_qs_t = torch.stack(online_selected_qs, dim=1)         # [B, n_mode_agents]
+    target_next_max_qs_t = torch.stack(target_next_max_qs, dim=1)         # [B, n_mode_agents]
+    assert online_selected_qs_t.shape[1] == n_mode_agents
 
     q_tot = mixer(states_t, online_selected_qs_t)                         # [B]
     with torch.no_grad():
@@ -452,24 +599,23 @@ def _sample_and_update(
 
     loss = F.mse_loss(q_tot, td_target)
 
-    # Joint optimization over all online nets + mixer
-    for net in agent_nets:
-        net.optimizer.zero_grad()
+    # Joint optimization is restricted to the current same-mode team.
+    for agent_id in agent_ids:
+        agent_nets[agent_id].optimizer.zero_grad()
     mixer.optimizer.zero_grad()
 
     loss.backward()
 
-    for net in agent_nets:
-        net.optimizer.step()
+    for agent_id in agent_ids:
+        agent_nets[agent_id].optimizer.step()
     mixer.optimizer.step()
-
 
 def train(
     env,
     params: Dict,
     l_params: Dict,
     agent_nets: List[AgentQNetwork],
-    mixer: QMIXMixer,
+    mixer: Dict[str, QMIXMixer],
     cluster_dict: Dict,
     cluster_actions_dict: Dict,
     cluster_action_dict: Dict,
@@ -489,7 +635,7 @@ def train(
     print_metrics: int,
     logger,
     visualizer=None,
-) -> Tuple[List[AgentQNetwork], QMIXMixer]:
+) -> Tuple[List[AgentQNetwork], Dict[str, QMIXMixer]]:
     del agent_learning_rate, mixer_learning_rate  # optimizers are bound to modules
 
     n_obs = env.observations_n()
@@ -506,9 +652,12 @@ def train(
     target_update_mode = str(l_params.get("target_update_mode", "hard"))  # hard | soft
     tau = float(l_params.get("tau", 0.01))
 
-    replay = ReplayBuffer(replay_capacity)
+    agent_ids_by_mode = _agent_ids_by_mode_from_env(env)
+    _assert_mode_mixers(mixer, agent_ids_by_mode, n_obs)
 
-    # Target networks
+    replay_by_mode = {mode: ReplayBuffer(replay_capacity) for mode in agent_ids_by_mode}
+
+    # Target networks remain per physical agent, but mixers are per learner mode.
     target_agent_nets = [
         AgentQNetwork(n_obs, int(l_params.get("agent_hidden_dim", 32)), n_actions, float(l_params.get("alpha", 0.001)), device)
         for _ in range(n_agents)
@@ -516,27 +665,28 @@ def train(
     for i in range(n_agents):
         _hard_update(target_agent_nets[i], agent_nets[i])
 
-    target_mixer = QMIXMixer(
-        n_agents=n_agents,
-        state_dim=n_agents * n_obs,
+    target_mixers = _create_mode_mixers(
+        agent_ids_by_mode=agent_ids_by_mode,
+        n_obs=n_obs,
         hidden_dim=int(l_params.get("mixer_hidden_dim", 32)),
         learning_rate=float(l_params.get("mixer_learning_rate", l_params.get("alpha", 0.001))),
         device=device,
     )
-    _hard_update(target_mixer, mixer)
+    for mode in agent_ids_by_mode:
+        _hard_update(target_mixers[mode], mixer[mode])
 
     old_state_vec: Dict[str, NDArray] = {}
     old_action: Dict[str, int] = {}
     prev_snapshot: Dict[int, Dict] = {}
     global_step = 0
-    gradient_steps = 0
+    gradient_steps_by_mode = {mode: 0 for mode in agent_ids_by_mode}
 
     only_cluster_dict = {str(ep): 0.0 for ep in range(1, train_episodes + 1)}
     mixed_cluster_dict = {str(ep): 0.0 for ep in range(1, train_episodes + 1)}
     only_scatter_dict = {str(ep): 0.0 for ep in range(1, train_episodes + 1)}
     mixed_scatter_dict = {str(ep): 0.0 for ep in range(1, train_episodes + 1)}
 
-    print("Start training (QMIX-NN, replay + mini-batch)...\n")
+    print("Start training (QMIX-NN, same-mode replay + mini-batch)...\n")
 
     for ep in tqdm(range(1, train_episodes + 1), desc="EPISODES", colour="red", position=0, leave=False):
         env.reset()
@@ -584,51 +734,58 @@ def train(
                     scatter_reward_dict,
                 )
 
-            # Push joint transition after we have both previous and current snapshots
+            # Push one transition per learner mode. Each transition, reward, replay
+            # buffer, mixer, and gradient step is restricted to same-mode agents.
             if prev_snapshot:
-                ids = sorted(prev_snapshot.keys())
-                global_state = np.concatenate([prev_snapshot[ag]["state_vec"] for ag in ids]).astype(np.float32)
-                next_global_state = np.concatenate([snapshot[ag]["state_vec"] for ag in ids]).astype(np.float32)
-                actions = np.asarray([prev_snapshot[ag]["action"] for ag in ids], dtype=np.int64)
-                team_reward = float(sum(prev_snapshot[ag]["reward"] for ag in ids))
-                # The current env API does not expose per-tick terminal flags in this loop.
-                done = 0.0
-                replay.push(
-                    Transition(
-                        global_state=global_state,
-                        actions=actions,
-                        team_reward=team_reward,
-                        next_global_state=next_global_state,
-                        done=done,
-                    )
-                )
+                for mode, agent_ids in agent_ids_by_mode.items():
+                    if not all(ag in prev_snapshot and ag in snapshot for ag in agent_ids):
+                        continue
 
-                # Train from replay
-                if len(replay) >= max(batch_size, learning_starts) and global_step % max(1, train_every) == 0:
-                    _sample_and_update(
-                        replay=replay,
-                        batch_size=batch_size,
-                        n_agents=n_agents,
-                        n_obs=n_obs,
-                        gamma=gamma,
-                        device=device,
-                        agent_nets=agent_nets,
-                        mixer=mixer,
-                        target_agent_nets=target_agent_nets,
-                        target_mixer=target_mixer,
+                    global_state = np.concatenate([prev_snapshot[ag]["state_vec"] for ag in agent_ids]).astype(np.float32)
+                    next_global_state = np.concatenate([snapshot[ag]["state_vec"] for ag in agent_ids]).astype(np.float32)
+                    actions = np.asarray([prev_snapshot[ag]["action"] for ag in agent_ids], dtype=np.int64)
+                    team_reward = float(sum(prev_snapshot[ag]["reward"] for ag in agent_ids))
+                    # The current env API does not expose per-tick terminal flags in this loop.
+                    done = 0.0
+                    replay_by_mode[mode].push(
+                        Transition(
+                            global_state=global_state,
+                            actions=actions,
+                            team_reward=team_reward,
+                            next_global_state=next_global_state,
+                            done=done,
+                        )
                     )
-                    gradient_steps += 1
 
-                    # Target update
-                    if target_update_mode == "soft":
-                        for i in range(n_agents):
-                            _soft_update(target_agent_nets[i], agent_nets[i], tau)
-                        _soft_update(target_mixer, mixer, tau)
-                    else:
-                        if gradient_steps % max(1, target_update_interval) == 0:
-                            for i in range(n_agents):
-                                _hard_update(target_agent_nets[i], agent_nets[i])
-                            _hard_update(target_mixer, mixer)
+                    # Train from this mode's replay only.
+                    if (
+                        len(replay_by_mode[mode]) >= max(batch_size, learning_starts)
+                        and global_step % max(1, train_every) == 0
+                    ):
+                        _sample_and_update(
+                            replay=replay_by_mode[mode],
+                            batch_size=batch_size,
+                            agent_ids=agent_ids,
+                            n_obs=n_obs,
+                            gamma=gamma,
+                            device=device,
+                            agent_nets=agent_nets,
+                            mixer=mixer[mode],
+                            target_agent_nets=target_agent_nets,
+                            target_mixer=target_mixers[mode],
+                        )
+                        gradient_steps_by_mode[mode] += 1
+
+                        # Target updates are also mode-local.
+                        if target_update_mode == "soft":
+                            for agent_id in agent_ids:
+                                _soft_update(target_agent_nets[agent_id], agent_nets[agent_id], tau)
+                            _soft_update(target_mixers[mode], mixer[mode], tau)
+                        else:
+                            if gradient_steps_by_mode[mode] % max(1, target_update_interval) == 0:
+                                for agent_id in agent_ids:
+                                    _hard_update(target_agent_nets[agent_id], agent_nets[agent_id])
+                                _hard_update(target_mixers[mode], mixer[mode])
 
                 global_step += 1
 
@@ -820,4 +977,3 @@ def eval(
     if visualizer is not None:
         visualizer.close()
     print("Evaluation finished (QMIX-NN)!\n")
-
