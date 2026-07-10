@@ -1,5 +1,10 @@
 {
     "train_log_every": 1,
     "test_log_every": 1,
-    "buffer_size": 1000
+    "train_params_file": "mappo_train_params",
+    "train_output_file": "mappo_train_output",
+    "train_weights_file": "mappo_train_weights",
+    "eval_params_file": "mappo_eval_params",
+    "eval_output_file": "mappo_eval_output",
+    "buffer_size": 10000
 }
