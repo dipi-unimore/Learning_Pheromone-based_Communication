@@ -709,6 +709,351 @@ python slime_qmix_nn.py --train True --random_seed 99
 
 ---
 
+### MAPPOLearning
+
+`MAPPOLearning` implements a PyTorch-based Multi-Agent Proximal Policy Optimization learner for the Slime environment.
+
+MAPPO follows the centralized-training/decentralized-execution pattern:
+
+- during execution, each agent acts from a local actor policy that only receives that agent's observation;
+- during training, a centralized critic can use additional same-group information to produce lower-variance value estimates;
+- PPO's clipped policy update is used to keep policy updates close to the behavior policy that generated the rollout data.
+
+This implementation preserves the same-kind learning constraint used elsewhere in the project. The Slime environment has two learner modes:
+
+- cluster agents: mode `"c"`;
+- scatter agents: mode `"s"`.
+
+MAPPO therefore uses independent mode-local critics:
+
+```text
+critics["c"] -> centralized critic for cluster agents only
+critics["s"] -> centralized critic for scatter agents only
+```
+
+Cluster observations, rewards, actions, advantages, value targets, and critic gradients are kept separate from scatter observations, rewards, actions, advantages, value targets, and critic gradients. Cluster and scatter agents can still interact through the shared Slime world dynamics, but they do not share learning data through the MAPPO update.
+
+#### Implementation summary
+
+The MAPPO implementation is provided by:
+
+```text
+agents/MAPPOLearning/mappo.py
+slime_mappo.py
+agents/MAPPOLearning/config/learning-params.json
+agents/MAPPOLearning/config/logger-params.json
+```
+
+The learner contains the following main components.
+
+| Component | Purpose |
+|---|---|
+| `ActorPolicy` | Decentralized stochastic policy network. Each actor maps one local observation to action logits. |
+| `CentralValueCritic` | Mode-local centralized critic. The cluster critic receives only cluster-agent observations; the scatter critic receives only scatter-agent observations. |
+| `ModeRolloutBuffer` | On-policy rollout storage for one mode only. Cluster and scatter rollout data are stored separately. |
+| `ModeTransition` | One same-mode transition containing same-mode observations, actions, log-probabilities, rewards, next observations, and done flags. |
+| `create_agent()` | Builds actors, same-mode critics, optimizer-backed networks, logging dictionaries, and device information. |
+| `train()` | Collects rollouts, computes generalized advantage estimates, and applies PPO updates mode by mode. |
+| `eval()` | Runs decentralized evaluation. The action-selection policy is configurable through `evaluation_policy`: deterministic `argmax` over actor logits, or stochastic sampling from the actor distribution. |
+| `pack_model()` / `unpack_model()` | Packs and restores PyTorch parameters into/from a flat NumPy vector, preserving compatibility with the existing `.npy` logger workflow. |
+| `save_model()` / `load_model()` | Optional direct PyTorch checkpoint helpers. |
+
+Training proceeds as follows:
+
+1. Each agent receives its local Slime observation.
+2. The corresponding actor samples an action from a categorical distribution.
+3. The action, log-probability, reward, local observation, and next observation are saved in a same-mode rollout buffer.
+4. Once enough rollout steps are collected, PPO updates are run separately for each mode.
+5. For each mode, the centralized critic estimates values from same-mode joint observations.
+6. Generalized advantage estimation computes advantages and returns for that same-mode rollout.
+7. PPO updates the same-mode actors and same-mode critic using the clipped policy objective, value loss, entropy bonus, optional advantage normalization, and gradient clipping.
+
+The policy loss is the PPO clipped objective:
+
+```text
+ratio = pi_new(action | obs) / pi_old(action | obs)
+policy_loss = -mean(min(ratio * advantage,
+                        clip(ratio, 1 - clip_ratio, 1 + clip_ratio) * advantage))
+```
+
+The critic is trained with a value regression loss against the GAE return target:
+
+```text
+value_loss = mean((V_same_mode(obs_group) - return_target)^2)
+```
+
+The total optimization objective is:
+
+```text
+loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+```
+
+#### MAPPO learning configuration
+
+MAPPO uses:
+
+```text
+agents/MAPPOLearning/config/learning-params.json
+```
+
+Recommended starting configuration:
+
+```json
+{
+    "alpha": 0.0003,
+    "gamma": 0.99,
+    "train_episodes": 3000,
+    "test_episodes": 100,
+    "evaluation_policy": "deterministic",
+    "device": "auto",
+    "actor_hidden_dim": 64,
+    "critic_hidden_dim": 64,
+    "actor_learning_rate": 0.0003,
+    "critic_learning_rate": 0.001,
+    "actor_parameter_sharing": "none",
+    "rollout_steps": 256,
+    "ppo_epochs": 4,
+    "minibatch_size": 64,
+    "clip_ratio": 0.2,
+    "gae_lambda": 0.95,
+    "value_coef": 0.5,
+    "entropy_coef": 0.01,
+    "max_grad_norm": 0.5,
+    "normalize_advantages": true
+}
+```
+
+The defaults above are intentionally conservative for a small project environment. PPO literature commonly uses values such as `gamma = 0.99`, `clip_ratio = 0.2`, actor learning rate around `3e-4`, critic learning rate around `1e-3`, and GAE lambda close to 1. MAPPO literature additionally emphasizes limiting policy-update data reuse in multi-agent settings, because all agents' policies change together and excessive reuse can worsen non-stationarity.
+
+##### Base parameters
+
+| Field | Default | Suggested range | Description and tuning guidance |
+|---|---:|---:|---|
+| `alpha` | `0.0003` | `1e-4` to `3e-4` | Backward-compatible fallback learning rate. If `actor_learning_rate` is present, actors use `actor_learning_rate` instead. Keep this equal to `actor_learning_rate` unless you need compatibility with older launchers. |
+| `gamma` | `0.99` | `0.95` to `0.99` | Discount factor. PPO and GAE implementations commonly use high discount factors. Use `0.99` when clustering/scattering consequences are delayed across many ticks. Use `0.95` if returns are noisy or mostly immediate. |
+| `train_episodes` | `3000` | task-dependent | Number of training episodes. MAPPO is on-policy, so it usually needs more environment interaction than off-policy replay-buffer methods. |
+| `test_episodes` | `100` | `20` to `200` | Number of evaluation episodes. Increase for lower-variance evaluation curves. |
+| `evaluation_policy` | `"deterministic"` | `"deterministic"`, `"stochastic"` | Evaluation-time action selection. `"deterministic"` uses `argmax` over actor logits and is best for stable benchmark comparisons. `"stochastic"` samples from the learned categorical policy and is useful when you want evaluation to reflect the policy distribution, including residual exploration or mixed strategies. Accepted aliases include `"greedy"`/`"argmax"` for deterministic and `"sample"`/`"sampling"` for stochastic. |
+| `device` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"`, `"mps"` | Torch device. `"auto"` uses CUDA if available, then Apple MPS if available, otherwise CPU. |
+
+##### Network-size parameters
+
+| Field | Default | Suggested range | Description and tuning guidance |
+|---|---:|---:|---|
+| `actor_hidden_dim` | `64` | `32` to `128` | Hidden size of each actor MLP. Use `32` for very small observations or faster experiments. Use `128` if policies appear underfit. |
+| `critic_hidden_dim` | `64` | `64` to `256` | Hidden size of each mode-local critic MLP. The critic receives concatenated same-mode observations, so it may need more capacity than the actor when there are many same-mode agents. |
+
+##### Optimizer parameters
+
+| Field | Default | Suggested range | Description and tuning guidance |
+|---|---:|---:|---|
+| `actor_learning_rate` | `0.0003` | `1e-4` to `3e-4` | Learning rate for actor optimizers. PPO references and common implementations often start near `3e-4`. Reduce to `1e-4` if policy updates are unstable. |
+| `critic_learning_rate` | `0.001` | `3e-4` to `1e-3` | Learning rate for critic optimizers. A critic rate larger than the actor rate is common because the critic is a supervised value regressor. Reduce if value loss oscillates or dominates training. |
+| `max_grad_norm` | `0.5` | `0.5` to `1.0` | Global gradient clipping threshold. MAPPO/PPO implementations commonly use gradient clipping for stability. Set to `0` or a negative value only if you intentionally want to disable clipping. |
+
+##### Evaluation action selection
+
+`evaluation_policy` controls how actions are selected during evaluation only. Training always samples from the actor distribution, as required by PPO rollout collection.
+
+Use deterministic evaluation for most reported metrics:
+
+```json
+"evaluation_policy": "deterministic"
+```
+
+This selects the action with the largest actor logit. It removes sampling noise and makes different saved policies easier to compare.
+
+Use stochastic evaluation when you want to measure the actual learned policy distribution:
+
+```json
+"evaluation_policy": "stochastic"
+```
+
+This samples from the categorical policy. It can be useful if the task benefits from randomized behavior or if you intentionally keep entropy regularization high. Stochastic evaluation produces higher-variance test curves, so use more `test_episodes` when comparing runs.
+
+##### Actor parameter sharing
+
+| Field | Default | Supported values | Description and tuning guidance |
+|---|---|---|---|
+| `actor_parameter_sharing` | `"none"` | `"none"`, `"same_mode"` | Controls whether actors share parameters. `"none"` gives every physical agent its own actor. `"same_mode"` shares one actor among all cluster agents and one actor among all scatter agents. The implementation never shares actor parameters across cluster/scatter modes. |
+
+Parameter sharing is common in MAPPO benchmarks with homogeneous agents because it improves sample efficiency and reduces model size. In Slime, cluster and scatter agents have different reward semantics, so cross-mode sharing would violate the project constraint. Same-mode sharing can still be useful if all cluster agents are exchangeable and all scatter agents are exchangeable.
+
+Use:
+
+```json
+"actor_parameter_sharing": "none"
+```
+
+when same-mode agents may need specialized policies or when you want the least restrictive baseline.
+
+Use:
+
+```json
+"actor_parameter_sharing": "same_mode"
+```
+
+when same-mode agents are homogeneous and you want faster learning with fewer actor parameters.
+
+##### PPO rollout and update parameters
+
+| Field | Default | Literature-informed starting point | Description and tuning guidance |
+|---|---:|---:|---|
+| `rollout_steps` | `256` | `256` to one full episode | Number of same-mode transitions collected before a PPO update. Larger rollouts give lower-variance advantages but update the policy less often. For Slime with `episode_ticks = 500`, useful starting values are `256` or `500`. |
+| `ppo_epochs` | `4` | `5` to `10` for difficult/noisy tasks; up to `15` for easier tasks | Number of optimization passes over each collected rollout. MAPPO literature recommends limiting data reuse: more epochs can amplify multi-agent non-stationarity because every agent policy changes during training. The default `4` is conservative. Try `5`, then `10`, before going higher. |
+| `minibatch_size` | `64` | full rollout size for literature-faithful MAPPO | Minibatch size inside each PPO update. MAPPO ablations report that avoiding minibatch splitting can perform best. To approximate that behavior, set `minibatch_size >= rollout_steps`, for example `256` with `rollout_steps = 256` or `500` with `rollout_steps = 500`. Smaller minibatches are more memory-friendly but increase data reuse noise. |
+| `clip_ratio` | `0.2` | `0.05` to `0.2` | PPO clipping threshold. Standard PPO often uses `0.2`; MAPPO reports that smaller values can improve stability in multi-agent settings by limiting policy changes. Start with `0.2`; if training is volatile, try `0.1` or `0.05`. Avoid large values such as `0.3+` unless you have evidence that updates are too conservative. |
+| `gae_lambda` | `0.95` | `0.90` to `0.97` | Lambda parameter for generalized advantage estimation. Values close to 1 reduce bias but increase variance; lower values reduce variance but introduce more bias. `0.95` is a robust starting point. |
+
+##### Loss-weight parameters
+
+| Field | Default | Suggested range | Description and tuning guidance |
+|---|---:|---:|---|
+| `value_coef` | `0.5` | `0.25` to `1.0` | Weight of the centralized critic value loss. Increase if value estimates are poor. Decrease if the critic loss dominates actor learning. |
+| `entropy_coef` | `0.01` | `0.001` to `0.02` | Weight of the policy entropy bonus. Higher values encourage exploration; lower values allow faster exploitation. Start at `0.01`. If policies collapse too early to one action, increase slightly. If agents remain too random, decrease. |
+| `normalize_advantages` | `true` | usually `true` | Whether to standardize advantages inside each same-mode PPO batch. This is usually helpful for numerical stability, especially when reward scales differ or rollouts are noisy. |
+
+`normalize_advantages` is not the same as MAPPO value normalization. Value normalization normalizes critic regression targets; this implementation currently exposes advantage normalization only. MAPPO literature reports value normalization as an important stabilizer, so if value learning is unstable in this project, adding explicit value-target normalization would be a reasonable future extension.
+
+#### Suggested configurations
+
+##### Conservative default
+
+Good first run for Slime:
+
+```json
+{
+    "actor_learning_rate": 0.0003,
+    "critic_learning_rate": 0.001,
+    "actor_parameter_sharing": "none",
+    "rollout_steps": 256,
+    "ppo_epochs": 4,
+    "minibatch_size": 64,
+    "clip_ratio": 0.2,
+    "gae_lambda": 0.95,
+    "value_coef": 0.5,
+    "entropy_coef": 0.01,
+    "max_grad_norm": 0.5,
+    "normalize_advantages": true
+}
+```
+
+This is compute-friendly and conservative. It does use minibatches, so it is not the most literature-faithful MAPPO setting, but it is practical for quick experiments.
+
+##### Literature-faithful MAPPO-style update
+
+Closer to the MAPPO ablation advice about limiting data reuse and avoiding minibatch splitting:
+
+```json
+{
+    "rollout_steps": 500,
+    "ppo_epochs": 5,
+    "minibatch_size": 500,
+    "clip_ratio": 0.1,
+    "gae_lambda": 0.95,
+    "normalize_advantages": true
+}
+```
+
+Use this when stability matters more than update frequency. With `episode_ticks = 500`, this approximately updates once per episode using the full same-mode rollout.
+
+##### Same-mode parameter sharing
+
+Useful when all cluster agents are exchangeable and all scatter agents are exchangeable:
+
+```json
+{
+    "actor_parameter_sharing": "same_mode",
+    "actor_learning_rate": 0.0003,
+    "critic_learning_rate": 0.001,
+    "rollout_steps": 256,
+    "ppo_epochs": 5,
+    "minibatch_size": 256,
+    "clip_ratio": 0.1
+}
+```
+
+This reduces the number of actor networks and increases the amount of data seen by each same-mode actor. It still does not share parameters between cluster and scatter modes.
+
+##### More exploration
+
+Useful when agents converge prematurely to poor repeated actions:
+
+```json
+{
+    "entropy_coef": 0.02,
+    "clip_ratio": 0.1,
+    "ppo_epochs": 4
+}
+```
+
+Increasing entropy encourages more stochastic actions. Pair it with a moderate or small clip ratio to avoid overly large policy jumps.
+
+##### More stable but slower learning
+
+Useful when returns or action frequencies are highly volatile:
+
+```json
+{
+    "actor_learning_rate": 0.0001,
+    "critic_learning_rate": 0.0003,
+    "clip_ratio": 0.05,
+    "ppo_epochs": 3,
+    "minibatch_size": 256,
+    "max_grad_norm": 0.5
+}
+```
+
+This reduces update size through lower learning rates, tighter clipping, fewer epochs, and larger minibatches.
+
+#### Launcher usage
+
+The MAPPO launcher mirrors the existing Slime launchers:
+
+```bash
+python slime_mappo.py --train True --random_seed 99
+python slime_mappo.py --train True --random_seeds 10 20 30
+python slime_mappo.py --train True --experiments_dir experiments --random_seeds 10 20 30
+```
+
+To train with explicit config paths:
+
+```bash
+python slime_mappo.py \
+  --train True \
+  --random_seed 99 \
+  --params_path environments/slime/config/env-params.json \
+  --learning_params_path agents/MAPPOLearning/config/learning-params.json \
+  --logger_params_path agents/MAPPOLearning/config/logger-params.json
+```
+
+To run evaluation from a saved model:
+
+```bash
+python slime_mappo.py --train False --qtable_path path/to/saved_model.npy --random_seed 99
+```
+
+The argument is still named `--qtable_path` for compatibility with the existing launchers, but for MAPPO the file contains packed PyTorch actor and critic weights, not a tabular Q-table.
+
+The launcher supports the same experiment-directory convention as the other algorithms. For example, an experiment directory may contain:
+
+```text
+env-params-1.json
+learning-params-1.json
+logger-params-1.json
+env-params-2.json
+learning-params-2.json
+logger-params-2.json
+```
+
+Then run:
+
+```bash
+python slime_mappo.py --train True --experiments_dir experiments --random_seeds 10 20 30
+```
+
+----
+
 ### Deterministic Policy
     
 The main script is `slime_deterministic.py`, which accepts the following command-line arguments:

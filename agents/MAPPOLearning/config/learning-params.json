@@ -1,0 +1,22 @@
+{
+    "alpha": 0.0003,
+    "gamma": 0.99,
+    "train_episodes": 3000,
+    "test_episodes": 100,
+    "evaluation_policy": "deterministic",
+    "device": "auto",
+    "actor_hidden_dim": 64,
+    "critic_hidden_dim": 64,
+    "actor_learning_rate": 0.0003,
+    "critic_learning_rate": 0.001,
+    "actor_parameter_sharing": "none",
+    "rollout_steps": 256,
+    "ppo_epochs": 4,
+    "minibatch_size": 64,
+    "clip_ratio": 0.2,
+    "gae_lambda": 0.95,
+    "value_coef": 0.5,
+    "entropy_coef": 0.01,
+    "max_grad_norm": 0.5,
+    "normalize_advantages": true
+}
