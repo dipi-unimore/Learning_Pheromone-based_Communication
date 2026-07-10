@@ -27,6 +27,27 @@ import torch.optim as optim
 from torch.distributions import Categorical
 from tqdm import tqdm
 
+def _align_logger_row_with_schema(value: List[float], logger, label: str) -> List[float]:
+    metrics = getattr(logger, "metrics", None)
+    if metrics is None:
+        return value
+
+    expected = len(metrics)
+    actual = len(value)
+    if actual == expected:
+        return value
+
+    if actual + 1 == expected:
+        missing_metric = str(metrics[-1]).lower()
+        if "epsilon" in missing_metric or missing_metric in {"eps", "exploration", "exploration_rate"}:
+            value.append(float("nan"))
+            return value
+
+    raise ValueError(
+        f"MAPPO logger row/schema mismatch during {label}: "
+        f"row has {actual} values but logger expects {expected} columns. "
+        "This usually means the MAPPO metric row and Logger.metrics schema are out of sync."
+    )
 
 # ---------------------------------------------------------------------------
 # Device / observation helpers
@@ -565,6 +586,7 @@ def _log_episode_metrics(
         tmp = [list(v.values()) for v in scatter_action_dict[str(ep)].values()]
         value.extend(list(itertools.chain(*tmp)))
 
+    value = _align_logger_row_with_schema(value, logger, label)
     logger.load_value(value)
 
     if print_metrics > 0 and ep % print_metrics == 0:
